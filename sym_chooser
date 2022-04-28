@@ -1,0 +1,37 @@
+#michael.s.denney@gmail.com
+
+if [ $1 ] ; then
+   SERIAL=$1
+else
+   echo "Usage: sym_chooser serial(last 4 or full)"
+   exit 0
+fi
+##get just the last 4 numbers entereed
+short_serial=`echo $1|sed 's/.*\(....\)$/\1/'`
+#use the perf file if exists, else use the old method
+if [ -f /apps/srt/var/arrays/$short_serial/perf ] ; then
+    #echo perf exists for $1
+    LOWEST_TIME=9999999999
+    while read LINE ; do
+         echo $LINE
+         RTIME=`echo $LINE|awk '{print $1}'`
+         if [ $RTIME -lt $LOWEST_TIME ] ; then
+            LOWEST_TIME=$RTIME
+            SYM=`echo $LINE|awk '{print $2}'`
+         fi
+    done < /apps/srt/var/arrays/$short_serial/perf
+    echo "export SYMCLI_CONNECT=$SYM"
+    export SYMCLI_CONNECT=$SYM
+else
+
+    ##the old method fall back if perf file does not exist
+    END_RESULT=$(basename `grep "$SERIAL Local" /apps/srt/var/SYMCLI_CONNECT/*|tail -1|awk -F: '{print $1}'` 2>/dev/null)
+    if [ $? != 0 ]; then
+       echo "$SERIAL not found"
+       exit 0
+    fi
+    if [ $END_RESULT != '.' ] ; then
+        echo "export SYMCLI_CONNECT=$END_RESULT"
+        export SYMCLI_CONNECT=$END_RESULT
+    fi
+fi 

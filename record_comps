@@ -1,0 +1,367 @@
+#michael.s.denney@gmail.com
+##########################################################
+# record_comps.pl
+# Query the SRDB for reclaim team and record the results
+# to flat csv files.
+# The purpose of these files is to record the comps assigned over
+# time because the srdb databse does not record when a disk tech
+# assignment occurs.
+#Michael.S.Denney@gmail.com
+my $VERSION=1.3;
+##########################################################
+#TO DO:
+#Version history
+#1.0 Initial copy from tracker.cgi
+#1.1 First version
+#1.3 Cleaned up subs,vars and sql leftover from original tracker.cgi
+##########################################################
+use strict;
+use Data::Dumper;
+use Getopt::Long;
+use Time::Local;
+use Env;
+use DBI;
+use Rpt;
+use Common;
+use Logfile::Rotate;
+##################Global VARS#################################
+my $common_obj=Common->new;
+$common_obj->log_name('/apps/srt/tracker/var/record_comps/logs/record_comps.log');
+use vars qw(@rpt @error_rpt @rpt_headers $mail_to);
+use vars qw(%users_where %users_map %formats %arrays);
+use vars qw($total_closed $total_gb_reclaimed $total_ports_reclaimed);
+use vars qw($total_open $total_created $weekly_open $weekly_created);
+use vars qw($weekly_closed $weekly_gb_reclaimed $weekly_ports_reclaimed);
+use vars qw($ports_pending $total_delete $total_rejected);
+$total_closed=$total_gb_reclaimed=$total_ports_reclaimed=0;
+$total_open=$total_created=$weekly_open=$weekly_created=0;
+$weekly_closed=$weekly_gb_reclaimed=$weekly_ports_reclaimed=0;
+$ports_pending=$total_delete=$total_rejected=0;
+
+##################Predeclare SUBS#############################
+use subs qw(select_query from_query where_query order_query);
+use subs qw(no_techs load_techs rpt_headers);
+##############SANITY CHECKS AND PREPS#########################
+##############ENV SETTINGS ###################################
+$ENV{LIBRARY_PATH}='/usr/local/lib';
+##############################################################
+my %configs=read_config('/apps/srt/tracker/etc/tracker.conf');
+my $verbose=0;my $debug=0;
+my $open=0;my $closed=0;my $srdb_num=0;
+GetOptions(
+          's=i' => \$srdb_num,
+          'v' => \$verbose,
+          'd' => \$debug,
+);
+
+$verbose=1 if ($debug);
+my %techs;
+foreach (@ARGV){
+   $techs{lc $_}=1;
+}
+###########################################################################
+##convert all %configs keys to lower case
+%configs = map { lc $_ => $configs{$_} } keys %configs; 
+say "CONFIGS=>" if $debug;
+print Dumper(%configs) if $debug;
+
+load_techs;
+unless (%users_where){
+    say "No techs located in tracker.conf"; exit;
+}
+
+my $data_source='ODBC:SRDB';
+my $username='TechwebRead';
+my $auth='techweb1read';
+
+my $dbh = DBI->connect('dbi:ODBC:SRDB',$username,$auth,{ RaiseError => 1, AutoCommit => 0 });
+unless ($dbh){
+  print "Failed to connect\n";
+  exit 1;
+}
+
+my $select_query=select_query;
+my $from_query=from_query;
+my $where_query=where_query;
+my $order_query=order_query;
+my $query=$select_query.$from_query.$where_query.$order_query;
+
+my $sth = $dbh->prepare($query);
+$sth->{LongReadLen}=180;
+my $rv = $sth->execute;
+unless ($rv) {
+  print ERROR with sql-> $dbh->errstr."\n";
+  exit 1;
+}
+
+my $row_cnt=0;
+ while (my $ref = $sth->fetchrow_hashref) {
+   #print "$_\n" foreach (keys %$ref);
+   #print $ref->{'SRDB.Comp'}." ".$ref->{'Additional_Comp_Info'}."\n";
+   $row_cnt++;##first row is header, so increment before add to @rpt
+   push @rpt,[
+              $$ref{'SRDB.Comp'}||' ',
+              $$ref{'Comp Status'}||' ',
+              $users_where{$$ref{'Disk Tech'}}{short}||' ',
+              $$ref{'Comp_Create_Date'}||' ',
+              $$ref{'Target_Impl_Date'}||' ',
+              $$ref{'Scheduled'}||' ',
+              $$ref{'Nexus'}||' ',
+              $$ref{'Last Update'}||' ',
+              $$ref{'Last Updated by'}||' ',
+              $$ref{'Server Name'}||' '
+             ];
+#next unless ($$ref{'SRDB.Comp'} =~ /12078\.1/);
+             say "SRDB.comp=>$$ref{'SRDB.Comp'} Request_Status=>$$ref{'Comp Status'}<=" if $debug;
+             #say "Comp Status=>".$$ref{'Comp Status'};
+             if ($$ref{'Comp Status'} =~ /Closed/i){
+                #say "setting row $row_cnt light green" if $debug;
+             }
+ }#end while my $ref = $sth->fetchrow_hashref
+#print Dumper(@rpt);
+
+$sth->finish;
+$dbh->rollback;
+$dbh->disconnect;
+my $csv_file='/apps/srt/tracker/var/record_comps/db/comps.csv';
+if (-f $csv_file) {
+my $comps = new Logfile::Rotate( 
+                                  File   => $csv_file, 
+                                  Gzip   => 'no',
+                                  Count  => 8,
+                                  Flock  => 'yes',
+                                  Persist => 'yes'
+                                );
+   $comps->rotate 
+}
+
+
+my $rpt_object=Rpt->new;
+my @headers=rpt_headers;
+$rpt_object->write_csv_file($csv_file,\@headers,\@rpt);
+
+exit;
+###########################################################################
+sub date_to_epoch{
+###########################################################################
+    my $date=shift;
+    my @line=split /\//,$date;
+    my $mon=$line[0]; $mon--;
+    my $mday=$line[1];
+    my $year=$line[2];
+    #print "\ndate=>$date";
+    #print " mon=>$mon mday=>$mday year=>$year ";
+    #my $time = timelocal(59,59,23,$mday,$mon,$year);
+    my $time = timelocal(00,00,00,$mday,$mon,$year);
+    #say "epoch=>$time";
+    return $time;
+}
+my %server_port_counted;
+my %pending_server_port_counted;
+my %weekly_server_port_counted;
+###########################################################################
+sub email_rpts{
+###########################################################################
+   my $ref=$_[0];
+   my $add_info=$_[1];
+   my $crr_info=$_[2];
+   return unless (($$ref{'Growth_Type'} eq 'Reclaim')||
+      ($$ref{'Growth_Type'} eq 'Reclaim Factory'));
+   my $week_epoch=time-(8*86400);#note 8 days
+   #print "SRDB.comp=>$$ref{'SRDB.Comp'} comp create=>$$ref{'Comp_Create_Date'} ";
+   #print "Comp Status=>$$ref{'Comp Status'} Alloc=>$$ref{'Alloc'} ";
+   $total_created++;
+   my $epoch=date_to_epoch($$ref{'Comp_Create_Date'});
+   $weekly_created++ if ($epoch > $week_epoch);
+   if (uc $$ref{'Comp Status'} eq uc 'DELETE'){
+       $total_delete++;
+       return;
+   }
+   if ($$ref{'Comp Status'} eq 'Rejected'){
+       $total_rejected++;
+       return;
+   }
+   if ($$ref{'Comp Status'} eq 'Closed') {
+       #print "Comp Complete=>$$ref{'Comp Complete'}";
+       if ($$ref{'Comp Complete'}){
+          my $epoch=date_to_epoch($$ref{'Comp Complete'});
+          #print " Epoch=>$epoch";
+          if ($epoch > $week_epoch){
+             $weekly_closed++;
+             $weekly_gb_reclaimed+=$$ref{'Alloc'};
+          }
+       }
+       #say "Array name=$$ref{'Disk Subsystem'}";
+       $arrays{lc $$ref{'Disk Subsystem'}}{reclaimed}+=$$ref{'Alloc'};
+       $total_closed++;
+       $total_gb_reclaimed+=$$ref{'Alloc'};
+   }#end if 'Comp Status' eq Closed
+      #if (lc $$add_info{'crr'} eq lc 'y'){
+#$$crr_info{'complete'}
+      if ($$add_info{'crr'} =~ /(y|\d+)/i){
+         unless ($pending_server_port_counted{$$ref{'Server_Name'}}){
+           #say "PENDING=>Comp Name=>$$ref{'SRDB.Comp'} Server Name=>$$ref{'Server_Name'}";
+            $ports_pending+=2;
+            $pending_server_port_counted{$$ref{'Server_Name'}}=1;
+         }#end unless $pending_server_port_counted
+      }
+      #if (lc $$add_info{'crr'} eq lc 'c'){
+      if ($$crr_info{'complete'} =~ /\d+(\/|\\|\-)\d+(\/|\\|\-)\d+/){
+          unless ($server_port_counted{$$ref{'Server_Name'}}){
+             #say "COMPLETE=>Comp Name=>$$ref{'SRDB.Comp'} Server Name=>$$ref{'Server_Name'}";
+             $total_ports_reclaimed+=2;
+             $server_port_counted{$$ref{'Server_Name'}}=1;
+          }#end unless $server_port_counted
+          if ($$ref{'Comp Complete'}){
+             my $epoch=date_to_epoch($$ref{'Comp Complete'});
+             unless ($weekly_server_port_counted{$$ref{'Server_Name'}}){
+                #say "WEEKLY=>Comp Name=>$$ref{'SRDB.Comp'} Server Name=>$$ref{'Server_Name'}";
+                $weekly_ports_reclaimed+=2 if ($epoch > $week_epoch);
+                $weekly_server_port_counted{$$ref{'Server_Name'}}=1;
+             }#end unless $weekly_server_port_counted
+          }
+      }#end if $add_info{crr} eq c
+    #print "\n";
+   if (($$ref{'Comp Status'} eq 'Capacity Reserved') ||
+       ($$ref{'Comp Status'} eq 'New')){
+        $total_open+=1;
+        $users_where{$$ref{'Disk Tech'}}{'open'}+=1;
+        $arrays{lc $$ref{'Disk Subsystem'}}{pending}+=$$ref{'Alloc'};
+   }
+}
+#$total_open $total_created $weekly_open $weekly_created)
+###########################################################################
+sub load_techs{
+###########################################################################
+   foreach (sort keys %configs){
+      next if ($_ eq 'reclaim_team');
+      $techs{$_}=1;
+   }
+   foreach (sort keys %techs){
+      my $tech=lc $_;
+      my ($fullname,$append);
+      print "tech=>$_ " if $verbose;
+      unless ($configs{$tech}){
+         say ",WARN unable to find $_ in tracker.conf";
+         next;
+      }
+      ($fullname,$append)=split /,/,$configs{$tech};
+      my ($first,$middle,$last)=split /\s+/,$fullname;
+      if ($last){
+         $first="$first $middle";
+      } else { $last=$middle}
+      if ($verbose){say "first=>$first<=  last=>$last<=";}
+      #$users_where{$first.$last}=$tech;
+      $users_where{"$first $last"}{short}=$tech;
+      $users_where{"$first $last"}{full}=$first.$last;
+      $users_where{"$first $last"}{'open'}=0;
+   }
+   print Dumper(%users_where) if $debug;
+}
+###########################################################################
+sub rpt_headers{
+###########################################################################
+    my @headers=(
+      'SRDB.Comp',
+      'Comp Status',
+      'Disk Tech',
+      'Comp Create',
+      'Target Implementation',
+      'Scheduled',
+      'Nexus',
+      'Last Update',
+      'Last Updated by',
+      'Server Name'
+   );
+   return @headers;
+}#end sub rpt_headers
+###########################################################################
+sub select_query{
+###########################################################################
+my $select_query=<<END;
+SELECT
+StorageReqs_Server.Server_Name,
+StorageReqs_Request_Component.Growth_Type,
+StorageReqs_Request_Component.Target_Impl_Date,
+StorageReqs_Request_Component.Comp_Create_Date,
+StorageReqs_Storage_Request.Request_Status AS 'Request_Status',
+StorageReqs_Request_Component.Disk_Checklist5_TD AS 'Scheduled',
+cast(StorageReqs_Request_Component.Request_ID as varchar) + '.' + cast(StorageReqs_Request_Component.Comp_ID as varchar) as 'SRDB.Comp',
+StorageReqs_Storage_Request.NSR_NWR AS 'Nexus',
+StorageReqs_Storage_Request.AIT_Number AS 'AIT',
+StorageReqs_Server.Server_Name AS 'Server Name',
+StorageReqs_Request_Component.Disk_Data_Volume AS 'Alloc',
+StorageReqs_Users.FirstName + ' ' + StorageReqs_Users.LastName AS 'Disk Tech',
+StorageReqs_Storage_Request.Last_Updated_Timestamp AS 'Last Update',
+(SELECT  FirstName + ' ' + LastName FROM StorageReqs_Users WHERE  StorageReqs_Storage_Request.Last_Updated_By = StorageReqs_Users.PersonNumber) AS 'Last Updated by',
+StorageReqs_Request_Component.Connectivity_Type AS 'Disk Product',
+StorageReqs_Request_Component.Comp_Status AS 'Comp Status',
+StorageReqs_Request_Component.Disk_Checklist5_CD AS 'Comp Complete',
+StorageReqs_Request_Component.Additional_Comp_Info
+END
+return $select_query;
+}
+###########################################################################
+sub from_query{
+###########################################################################
+my $from_query=<<END;
+FROM StorageReqs_Request_Component INNER JOIN StorageReqs_Server
+ ON StorageReqs_Request_Component.Server_ID = StorageReqs_Server.Server_ID
+INNER JOIN StorageReqs_Storage_Request ON StorageReqs_Request_Component.Request_ID = StorageReqs_Storage_Request.Request_ID 
+INNER JOIN StorageReqs_Users ON StorageReqs_Request_Component.disk_contact_primary_pn  = cast(StorageReqs_Users.PersonNumber as varchar) 
+LEFT OUTER JOIN Storagereqs_Users as user_sse ON StorageReqs_Storage_Request.Assigned_CSR = cast(user_sse.PersonNumber as varchar)
+END
+return $from_query;
+}
+###########################################################################
+sub where_query{
+###########################################################################
+my $append_txt;
+if (%users_where){
+   $append_txt="AND (StorageReqs_Users.FirstName + StorageReqs_Users.LastName in (";
+   my $first=1;
+   foreach (keys %users_where){
+      $append_txt.="," unless ($first);
+      $append_txt.="'".$users_where{$_}{full}."'";
+      $first=0;
+   }
+   $append_txt.="))\n";
+}
+if ($srdb_num){
+   $append_txt.="AND StorageReqs_Request_Component.Request_ID in ('$srdb_num')\n";
+}
+#say "$append_txt";exit;
+#$append_txt="AND (StorageReqs_Users.FirstName + StorageReqs_Users.LastName in ('CraigDwyer','MichaelDenney','Raja VenkatKondu'))";
+
+my $where_query=<<END;
+WHERE
+(StorageReqs_Request_Component.Growth_Type not in ('zznyzz'))
+--(StorageReqs_Request_Component.Growth_Type in ('Reclaim','Reclaim Factory'))
+--(StorageReqs_Storage_Request.Request_Status not in ('closed', 'rejected'))
+--AND (StorageReqs_Request_Component.Comp_Status not in ('rejected','deleted', 'delete', 'closed', 'implemented'))
+--(StorageReqs_Request_Component.Work_Type='Disk')
+--AND (StorageReqs_Request_Component.Connectivity_Type in ('SAN Attached', 'Network Attached', 'Direct Attached'))
+
+
+--AND (StorageReqs_Users.PersonNumber='21077719')
+
+--AND (
+--StorageReqs_Users.FirstName + StorageReqs_Users.LastName in ('CraigDwyer','michaeldenney',))
+--OR  (StorageReqs_Users.FirstName + StorageReqs_Users.LastName='michaeldenney')
+    --) 
+--AND (StorageReqs_Users.PersonNumber='22993158')
+--AND (StorageReqs_Request_Component.Request_ID in ('7392','7492'))
+END
+$where_query.=$append_txt;
+return $where_query;
+}
+###########################################################################
+sub order_query{
+###########################################################################
+my $order_query=<<END;
+ORDER BY
+   StorageReqs_Request_Component.Request_ID DESC,
+   StorageReqs_Request_Component.COMP_ID DESC
+END
+return $order_query;
+}

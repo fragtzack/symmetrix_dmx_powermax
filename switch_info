@@ -1,0 +1,171 @@
+#michael.s.denney@gmail.com
+##########################################################
+# switch_info.pl
+# Query the SQL server storage database to pull out
+# switch and host  wwn info and place into csv file.
+#Michael.S.Denney@gmail.com
+my $VERSION=1.1;
+##########################################################
+#TO DO:
+#Version history
+#1.0 Initial copy from tracker.cgi
+#1.1 First working version
+##########################################################
+use strict;
+use Data::Dumper;
+use Getopt::Long;
+use Time::Local;
+use Env;
+use DBI;
+use Rpt;
+use Common;
+##################Global VARS#################################
+my $common_obj=Common->new;
+$common_obj->log_name('/apps/srt/tracker/var/switch_info/logs/switch_info.log');
+use vars qw(@rpt @error_rpt @rpt_headers);
+##################Predeclare SUBS#############################
+use subs qw(select_query from_query where_query order_query);
+use subs qw(rpt_headers);
+##############SANITY CHECKS AND PREPS#########################
+##############ENV SETTINGS ###################################
+$ENV{LIBRARY_PATH}='/usr/local/lib';
+##############################################################
+my %configs=read_config('/apps/srt/tracker/etc/tracker.conf');
+my $verbose=0;my $debug=0;
+GetOptions(
+          'v' => \$verbose,
+          'd' => \$debug,
+);
+
+$verbose=1 if ($debug);
+###########################################################################
+##convert all %configs keys to lower case
+%configs = map { lc $_ => $configs{$_} } keys %configs; 
+say "CONFIGS=>" if $debug;
+print Dumper(%configs) if $debug;
+
+my $data_source='ODBC:SRDB';
+my $username='storage_user';
+my $auth='storagesql';
+
+my $dbh = DBI->connect('dbi:ODBC:SRDB',$username,$auth,{ RaiseError => 1, AutoCommit => 0 });
+unless ($dbh){
+  print "Failed to connect\n";
+  exit 1;
+}
+
+my $select_query=select_query;
+my $from_query=from_query;
+my $where_query=where_query;
+my $order_query=order_query;
+my $query=$select_query.$from_query.$where_query.$order_query;
+
+my $sth = $dbh->prepare($query);
+$sth->{LongReadLen}=180;
+my $rv = $sth->execute;
+unless ($rv) {
+  print ERROR with sql-> $dbh->errstr."\n";
+  exit 1;
+}
+
+my $row_cnt=0;
+ while (my $ref = $sth->fetchrow_hashref) {
+   #print "$_\n" foreach (keys %$ref);
+   $row_cnt++;##first row is header, so increment before add to @rpt
+   push @rpt,[
+              $$ref{'switch_name'}||' ',
+              $$ref{'location'}||' ',
+              $$ref{'port'}||' ',
+              $$ref{'host_wwn'}||' '
+             ];
+ }#end while my $ref = $sth->fetchrow_hashref
+#print Dumper(@rpt);
+
+$sth->finish;
+$dbh->rollback;
+$dbh->disconnect;
+my $csv_file='/apps/srt/tracker/var/switch_info/db/new_switch_info.csv';
+
+my $rpt_object=Rpt->new;
+my @headers=rpt_headers;
+$rpt_object->write_csv_file($csv_file,\@headers,\@rpt);
+my $sort_file='/apps/srt/tracker/var/switch_info/db/sort_switch_info.csv';
+my $final_file='/apps/srt/tracker/var/switch_info/db/switch_info.csv';
+my $cmd="cat $final_file $csv_file > $sort_file";
+system($cmd);
+$cmd="sort $sort_file|uniq > $final_file";
+system($cmd);
+
+exit;
+###########################################################################
+sub date_to_epoch{
+###########################################################################
+    my $date=shift;
+    my @line=split /\//,$date;
+    my $mon=$line[0]; $mon--;
+    my $mday=$line[1];
+    my $year=$line[2];
+    #print "\ndate=>$date";
+    #print " mon=>$mon mday=>$mday year=>$year ";
+    #my $time = timelocal(59,59,23,$mday,$mon,$year);
+    my $time = timelocal(00,00,00,$mday,$mon,$year);
+    #say "epoch=>$time";
+    return $time;
+}
+###########################################################################
+sub rpt_headers{
+###########################################################################
+    my @headers=(
+      'Switch Name',
+      'Location',
+      'Port',
+      'Host WWN',
+      'Status',
+      'Last Update'
+   );
+   return @headers;
+}#end sub rpt_headers
+###########################################################################
+sub select_query{
+###########################################################################
+my $select_query=<<END;
+SELECT mr_san_port_inventory.spi_SwitchName AS switch_name,
+       mr_san_switch_inventory.ssi_SwitchLocation AS location,
+       mr_san_port_inventory.spi_PortNumber AS port,
+       mr_san_port_inventory.spi_DevicePortWWN AS host_wwn
+       --REPLACE (mr_san_port_inventory.spi_PortStatus,',',' ') AS status
+END
+return $select_query;
+}
+###########################################################################
+sub from_query{
+###########################################################################
+my $from_query=<<END;
+FROM    Storage.storage_user.mr_san_switch_inventory_NPV mr_san_switch_inventory
+       INNER JOIN
+          Storage.storage_user.mr_san_port_inventory_NPV mr_san_port_inventory
+       ON (mr_san_switch_inventory.ssi_SwitchName =
+              mr_san_port_inventory.spi_SwitchName)
+END
+return $from_query;
+}
+###########################################################################
+sub where_query{
+###########################################################################
+my $where_query=<<END;
+WHERE     
+       (mr_san_port_inventory.spi_DevicePortWWN IS NOT NULL)
+       AND (UPPER (mr_san_port_inventory.spi_PortStatus) LIKE
+               UPPER ('%Link=OK%'))
+END
+return $where_query;
+}
+###########################################################################
+sub order_query{
+###########################################################################
+my $order_query=<<END;
+ORDER BY
+   location ASC
+END
+return $order_query;
+}

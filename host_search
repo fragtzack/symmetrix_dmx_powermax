@@ -1,0 +1,145 @@
+#Michael Denney
+#Search the make_symm_info arrays for info on a host
+
+#Then create a listing of logins for each array.
+#Dumping the output into logins under each array directory
+###################     HISTORY    ###########################
+my $version=1.4;
+## 1.1 Getopt::Long options=> -l,--login
+## 1.2 reads from nbkbvva  home dir becase /var was full
+## 1.3 added -c and -j , search for additional wwns using devs
+## 1.4 Changed to using the /home/nbkbvva/reclaim locations
+#############################################################
+use common::sense;
+use File::Basename;
+use File::stat;
+use Time::localtime;
+use Getopt::Long;
+
+use subs qw(usage devs_also_used_by);
+
+my ($search_file,$lflag,$dflag,$jflag,$cflag,$hflag);
+GetOptions(
+          'h'|'help' => \$hflag,
+          'c'|'csv' => \$cflag,
+          'l'|'logins' => \$lflag,
+          'd'|'devs' => \$dflag,
+          'j'|'just' => \$jflag
+);
+usage if $hflag;
+$search_file='wwn-devs' if $dflag;
+$search_file='logins' if $lflag;
+$search_file='both' unless (($dflag)or($lflag));
+$search_file='both' if (($dflag)and($lflag));
+usage unless (@ARGV);
+
+###################PREPARE FOR RUN ############################
+my ($script,$script_path)=fileparse($0);
+my $logfile="$script_path/$script.log";
+#open LOG,"$logfile" or die "unable to open $logfile\n";
+my $base='/apps/srt';
+mkdir ($base,0755 ) unless ( -d $base);
+my $dirbase="$base/var/arrays";
+chdir $dirbase;
+my %devs;my %found_wwn_devs;
+
+foreach my $search (@ARGV){
+   my $cmd="grep -i $search *\/$search_file";
+   if ($search_file =~ /both/i){
+      $cmd="grep -i $search *\/logins;grep -i $search *\/wwn-devs";
+   }
+   #print "cmd=>$cmd\n";
+   my @stdout=qx/$cmd/; chomp @stdout;
+   foreach (@stdout){
+      #print "###################################################################\n";
+      my ($file_search,$leftover)=split /:/,$_;
+      #print "file_Search=>$file_search\n";
+      my $file_date=ctime(stat($file_search)->mtime);
+      #print "##########$file_search updated at $file_date##########\n";
+      if ($cflag){
+        s/\s/,/g ; 
+        s/$/,/g ; 
+      }
+      print "$_  =>$file_date\n";
+      if ($file_search =~ /^(\w+)\/wwn-devs/){
+         my $array=$1;
+         if ($leftover =~ /^(\w+)\s+(\w+)/){
+             #$wwn_found=$1;
+             #$dev=$2;
+             #print "FILE_SEARCH=>$array DEV=>$dev\n";
+             $devs{$array}{$2}=$file_date;#record the array/dev/file_date found
+             $found_wwn_devs{$1}=1;#record the wwn's found
+         }
+      
+      }#end if $file_sarch
+   }#end foreach @stdout
+}#end foreach my $search @ARGV
+unless (($lflag)or($jflag)) {
+   devs_also_used_by;
+}
+exit;
+###############################################################
+sub devs_also_used_by{
+###############################################################
+    #print "$_\n" foreach (keys %found_wwn_devs);
+    my $header_already_printed;
+    foreach my $array (keys %devs){
+       foreach my $dev (keys %{$devs{$array}}){
+          #print "array=>$array dev=>$dev\n";
+          my $cmd="grep -i \" $dev \" $array\/wwn-devs";
+          #print "cmd=>$cmd\n";
+          my @stdout=qx/$cmd/; chomp @stdout;
+          foreach (@stdout){
+             #the below if skips printing this line because the
+             #wwn has already been printing in the main code body
+             if (/^(\w+)/){
+                next if ($found_wwn_devs{$1});
+             }#
+             unless ($header_already_printed){
+               print "####################################################\n";   
+               print "DEVS LISTED ABOVE ALSO USED BY OTHER WWN's BELOW\n";   
+               print "####################################################\n";   
+               $header_already_printed=1;
+             }#end unless ($header_already_printed)
+             if ($cflag){
+                s/\s/,/g ; 
+                s/$/,/g ; 
+             }
+             print "$array/wwn-devs:$_ =>$devs{$array}{$dev}\n";
+          }#end foreach (@stdout);
+       }#end foreach my $dev (keys %{$devs{$array}})
+        #print "\n";
+    } #end foreach my $array (keys %devs)
+}
+###############################################################
+sub usage{
+###############################################################
+   print "NAME\n";
+   print "     host_search - search array database for wwn/hostnames\n";
+   print "SYNOPSIS\n";
+   print "     /tmp/host_search [-c|--csv] [-j|--just] [-l|--logins]\n";
+   print "                      [-h|--help] [-d|--devs] wwn <wwn wwn ...>\n";
+   print "DESCRIPTION\n";
+   print "     The host_search command searches a flat file database\n";
+   print "     structure of array information focused on WWN.\n";
+   print "     The search result will display the array serial number\n";
+   print "     followed by the result type: logins or wwn-dev\n";
+   print "     The information in the database is updated once a day.\n";
+   print "     host_search will return time stamp information for when\n";
+   print "     the last info update occured for your search.\n";
+   print "     wwn is the expected input, but any text will be searched.\n";
+   print "OPTIONS\n";
+   print "            -l only search logins\n";
+   print "            --logins only search logins\n";
+   print "            -d only search wwn-devs\n";
+   print "            --devs only search wwn-devs\n";
+   print "            -j just search the wwn-devs for the wwn specified\n";
+   print "            --just just search the wwn-devs for the wwn specified\n";
+   print "            -c put commas instead of spaces between the fields\n";
+   print "            --csv  put commas instead of spaces between the fields\n";
+   print "            -h this help screen\n";
+   print "            --help this help screen\n";
+
+   exit 1;
+}
+###############################################################

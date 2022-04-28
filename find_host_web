@@ -1,0 +1,227 @@
+#michael.s.denney@gmail.com
+##########################################################
+# find_host html display wrapper
+# find wwn info for host by searching various databases
+#Michael.S.Denney@gmail.com
+my $VERSION=1.01;
+##########################################################
+#TO DO:
+##########################################################
+use common::sense;
+use Data::Dumper;
+use Common;
+use Rpt;
+use CGI;
+use CGI::Carp qw(fatalsToBrowser);
+use Env;
+##################Global VARS#################################
+my $form;my $host_search;
+################## subs  #################################
+use subs qw(print_env print_form find_host print_html_head);
+use subs qw(sanity_check scope_devs_form);
+##############################################################
+$Common::log_off=1;
+$|=1;
+#exit 1 unless ($ARGV[0]);
+my $host_search=$ARGV[0];
+#$host_search=~s/hname=//g;
+#print "Content-Type: text/plain \n\n";
+#print "\n $host_search \n\n";
+#exit;
+my $form='<a href="http://lpnoa0l3.pno-p01.chp.bankofamerica.com">srt</a></br>';
+$form.='<form METHOD=GET ><input type="submit" value="Find Host"> <input name="hname" ></form>';
+my %input;
+my $cgi = new CGI;
+for my $key ( $cgi->param() ) {
+    $input{$key} = $cgi->param($key);
+}
+
+my $rpt_object=Rpt->new;
+#print_html_head;
+#unless ($input{hname}=~!/[\s\w]+/){
+unless ($input{hname}){
+   print_html_head; 
+   exit;
+}
+sanity_check if (defined $input{hname});
+print_env if ($input{hname} =~ /print_env/i);
+$input{hname}=lc $input{hname} if (defined $input{hname});
+find_host($input{hname}) if (defined $input{hname});
+#########################################################################
+sub find_host{
+#########################################################################
+#my $host_search=shift;
+my $cmd="/usr/local/bin/find_host $input{hname}";
+#print qq{Content-type: text/html
+
+#<html><head></head><body>
+#};
+#say "$cmd";
+my (@devs_rpt_header,@just_devs_header,@just_devs_rpt) ;
+my (@others_rpt_header) ;
+my (@devs_rpt,@others_rpt);
+my (@db_header,@db_rpt);
+my (@hs_header,@hs_rpt);
+my ($stdout,$stderr)=run_cmd($cmd);
+my ($host_search_cmd);
+exit 1 unless (@$stdout);
+foreach (@$stdout){
+   if (/^HOSTNAME\s+/){
+      @db_header=split /\s+/; next;
+   }
+   if (/^#\s+(host_search.*)/){
+      $host_search_cmd=$1; next;
+   }
+   next if (/^#######/);
+   if (/^SER\s+WWN\s+NODE/){
+      @hs_header=split /\s+/; next;
+   }
+   if (/^SER\s+WWN\s+DEV/){
+      @devs_rpt_header=split /\s+/; next;
+   }
+   if (/^#\s+DEVS\s+MASKED\s+TO/){
+       next;
+   }
+   if (/^#\s+DEVS\s+LISTED\s+ABOVE/){
+      @others_rpt_header=split /\s+/; next;
+   }
+   if (/^#\s+Just\s+the\s+symm/){
+      @just_devs_header=('Symm','Devs','Scope Devs Link');next;
+   }
+   my @line=split /\s+/;
+   if (@just_devs_header ){
+      my ($sym,$devs)=split /->/;
+      push @just_devs_rpt,[$sym,$devs];next;
+   }
+   if (@others_rpt_header){
+      push @others_rpt,[@line];next;
+   }
+   if (@devs_rpt_header){
+      push @devs_rpt,[@line];next;
+   }
+   if (@hs_header){
+      push @hs_rpt,[@line];next;
+   }
+  push @db_rpt,[@line];#if here, then top part of report
+}
+#print "cmd=>$host_search_cmd\n";exit;
+my $wwns=$host_search_cmd;
+$wwns=~s/host_search -l//g;
+my @eheaders;
+push @eheaders,'No results' unless (@db_rpt);
+push @eheaders,'combined found wwns' if @db_rpt;
+push @eheaders,$wwns if @db_rpt;
+$rpt_object->MakeEmailBodyHeaders("Reclaims Find Host $input{hname}",'',\@eheaders) if (@db_rpt);
+$rpt_object->email($form);
+$rpt_object->MakeEmailBody(\@db_header,\@db_rpt) if (@db_rpt);
+my @title=($host_search_cmd);
+$rpt_object->MakeEmailStatusHeaders('Green',\@title) if (@hs_rpt);
+$rpt_object->MakeEmailBody(\@hs_header,\@hs_rpt) if (@hs_rpt);
+#my $cmd=
+
+if (@devs_rpt){
+   my @title=('Devs masked to WWNS above');
+   $rpt_object->MakeEmailStatusHeaders('Green',\@title);
+   $rpt_object->MakeEmailBody(\@devs_rpt_header,\@devs_rpt);
+}
+
+if (@others_rpt){
+   my @title=('Devs listed above also masked to other WWNS below');
+   $rpt_object->MakeEmailStatusHeaders('Green',\@title);
+   $rpt_object->MakeEmailBody(\@devs_rpt_header,\@others_rpt);
+}
+
+if (@just_devs_rpt){
+   my @title=('Just sym->devs');
+   $rpt_object->MakeEmailStatusHeaders('Green',\@title);
+   my @new_array;
+   foreach my $aref(@just_devs_rpt){
+      my $symm=$$aref[0];
+      push @new_array,[$$aref[0],$$aref[1],scope_devs_link($$aref[0],$$aref[1])];
+   }
+   $rpt_object->MakeEmailBody(\@just_devs_header,\@new_array);
+}
+
+$rpt_object->email('</BR></BR>');
+my $master_url="curl http://mss.worldnet.ml.com:8080/cgi-bin/Reports/profile_report.pl?action=showdetail\\&profile=$input{hname}:S";
+my $master_link='<a href="http://mss.worldnet.ml.com:8080/cgi-bin/Reports/profile_report.pl?action=showdetail&profile=';
+$master_link.="$input{hname}:S\">Masters Profile $input{hname}</a></br>";
+($stdout,$stderr)=run_cmd($master_url);
+if (scalar @$stdout < 10 ){ #if profile not found,try again with CAP
+    my $CAPITOL=uc $input{hname};
+    my $CAP_URL="curl http://mss.worldnet.ml.com:8080/cgi-bin/Reports/profile_report.pl?action=showdetail\\&profile=$CAPITOL:S";
+    my $CAP_LINK='<a href="http://mss.worldnet.ml.com:8080/cgi-bin/Reports/profile_report.pl?action=showdetail&profile=';
+    $CAP_LINK.="$CAPITOL:S\">Masters Profile $CAPITOL</a></br>";
+    ($stdout,$stderr)=run_cmd($CAP_URL);
+    $rpt_object->email($CAP_LINK);# if (scalar @$stdout > 10 );
+}
+$rpt_object->email($master_link) if (scalar @$stdout > 10 );
+foreach (@$stdout){
+   s/<title>//g;
+   s/<\/title>//g;
+   $rpt_object->email($_) 
+}
+#open (TMP,">/tmp/html.out");
+#print TMP $master_url;
+#print TMP "LINE $_" foreach (@$stdout);
+#close TMP;
+$rpt_object->email("<Title>Find Host $input{hname}</Title>");
+print $rpt_object->email;
+exit;
+}
+#########################################################################
+sub print_html_head{
+#########################################################################
+my @eheaders;
+$rpt_object->MakeEmailBodyHeaders("Reclaims Find Host $input{hname}",'',\@eheaders);
+$rpt_object->email('<Title>Find Host</Title>');
+$rpt_object->email($form);
+print $rpt_object->email;
+}
+#########################################################################
+sub print_env{
+#########################################################################
+#print qq{Content-type: text/html
+
+#<html><head></head><body>
+#};
+print_html_head;
+
+foreach my $key (sort (keys %ENV)) {
+    print $key, ' = ', $ENV{$key}, "<br>\n";
+}
+
+for my $key ( keys %input ) {
+    print $key, ' = ', $input{$key}, "<br>\n";
+}
+print qq{</body></html>};
+exit;
+}
+#########################################################################
+sub print_form{
+#########################################################################
+print qq{Content-type: text/html
+
+<html><head></head><body>
+};
+  print qq{<form METHOD=GET ><input type="submit" value="Find Host">
+<input name="hname" ></form>};
+print qq{</body></html>};
+exit;
+}
+#########################################################################
+sub sanity_check{
+#########################################################################
+   
+}
+#########################################################################
+sub scope_devs_link{
+#########################################################################
+my $sym=shift;
+my $devs=shift;
+$devs=~s/\s+/+/g;
+$form=<<END;
+<a href="http://lpnoa0l3.pno-p01.chp.bankofamerica.com/cgi-bin/scope_devs.pl?SID=$sym&DEVS=$devs&SYMCLI=" target=_blank>Scope these devs</a>
+END
+return $form;
+}

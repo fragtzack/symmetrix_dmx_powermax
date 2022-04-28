@@ -1,0 +1,36 @@
+for i in 2F05 5D09 5D35 ;
+do
+sid=4622;
+symdev -sid $sid show $i > devproperties;
+SG=`symaccess -sid $sid list -type storage -dev $i | grep -i "_sg"|awk '{print $1}'`;
+Masking=`symaccess -sid $sid list assignment -dev $i | grep -i "FIBRE"|awk '{print $1 " " $2}'`;
+DG_name=`more devproperties|grep "Device Group Name"|awk '{print $5}'`;
+Array=`more devproperties|grep "Symmetrix ID             : " | awk '{print $4}'`;
+FA_mapped=`more devproperties|grep -w "FA" | awk '{print $5}'`;
+Dev_size=`more devproperties|grep "MegaBytes"|awk '{print $3}'`;
+Dev_conf=`more devproperties|grep "Device Configuration"|awk '{print $4 $5 $6}'`;
+Dev_status=`more devproperties|grep "Device Status"|awk '{print $4 $5}'`;
+SCSI_status=`more devproperties|grep "SCSI-3 Persistent Reserve"|awk '{print $4}'`;
+Meta_is=`more devproperties|grep "Meta Device Members"|awk '{print $4}'`;
+DevWWN=`more devproperties|grep "Device WWN"|awk '{print $4}'`;
+Thin_Pool_Name=`more devproperties|grep "Thin Pool Name"|awk '{print $6}'`;
+Dyn_rdf_status=`more devproperties|grep "Dynamic RDF Capability"|awk '{print $5}'`;
+RDFG=`more devproperties|grep "RDF (RA) Group Number"|awk '{print $6}'`;
+Remote_dev=`more devproperties|grep "Remote Device Symmetrix Name"|awk '{print $6}'`;
+Remote_symm=`more devproperties|grep "Remote Symmetrix ID"|awk '{print $5}'`;
+Rdf_state=`more devproperties|grep "RDF Pair State"|awk '{print $9 $10}'`;
+Rdf_mode=`more devproperties|grep "RDF Mode"|awk '{print $4}'`;
+Meta_members=`more devproperties|grep "  -       -  N/A  " | awk '{print $1}'`;
+BCV_STD_Name=`more devproperties|grep "Standard (STD) Device Symmetrix Name"|awk '{print $7}'`;
+BCV_STD_Dev_Grp_Name=`more devproperties|grep "Standard (STD) Device Group Name"|awk '{print $7}'`;
+BCV_STD_Composite_Grp_Name=`more devproperties|grep "Standard (STD) Composite Group Name"|awk '{print $7}'`;
+BCV_Name=`more devproperties|grep "BCV Device Symmetrix Name"|awk '{print $6}'`;
+BCV_Dev_Associated_Grp_Name=`more devproperties|grep "BCV Device Associated Group Name"|awk '{print $7}'`;
+BCV_Dev_Associated_CG_Name=`more devproperties|grep "BCV Device Associated CG Name"|awk '{print $7}'`;
+BCV_Dev_Status=`more devproperties|grep "BCV Device Status"|awk '{print $5 $6}'`;
+BCV_State_Of_Pair=`more devproperties|grep "State of Pair "|awk '{print $10}'`;
+BCV_Time_Last_BCV_Action=`more devproperties|grep "Time of Last BCV Action"|awk '{print $7 " " $8 " " $9 " " $10 " " $11}'`;
+BCV_State_of_Mirrors=`more devproperties|grep "State of BCV Mirrors"|awk '{print $6}'`;
+BCV_Percent_Split=`more devproperties|grep "Percent Split"|awk '{print $4}'`;
+echo $i" ; "Array= $Array" ; "DStatus= $Dev_status" ; "FA_mapped= $FA_mapped" ; "DType= $Dev_conf" ; "Size_In_MB= $Dev_size" ; "SCSI3= $SCSI_status" ; "DG= $DG_name" ; "Meta= $Meta_is" ; "Device_WWN= $DevWWN" ; "Thin_Pool_Name= $Thin_Pool_Name" ; "Dyn_RDF_status= $Dyn_rdf_status" ; "RDFG= $RDFG" ; "R2SYM= $Remote_symm" ; "$Remote_dev" ; "RDF_State= $Rdf_state" ; "RDF_Mode= $Rdf_mode" ; "Meta_members= $Meta_members" ; "SG= $SG" ; "Masking= $Masking " ; "BCV_STD_Name=$BCV_STD_Name" ; "BCV_STD_Dev_Grp_Name=$BCV_STD_Dev_Grp_Name" ; "BCV_STD_Composite_Grp_Name=$BCV_STD_Composite_Grp_Name" ; "BCV_Name=$BCV_Name" ; "BCV_Dev_Associated_Grp_Name=$BCV_Dev_Associated_Grp_Name" ; "BCV_Dev_Associated_CG_Name=$BCV_Dev_Associated_CG_Name" ; "BCV_Dev_Status=$BCV_Dev_Status" ; "BCV_State_Of_Pair=$BCV_State_Of_Pair" ; "BCV_Time_Last_BCV_Action=$BCV_Time_Last_BCV_Action" ; "BCV_State_of_Mirrors=$BCV_State_of_Mirrors" ; "BCV_Percent_Split=$BCV_Percent_Split;
+done

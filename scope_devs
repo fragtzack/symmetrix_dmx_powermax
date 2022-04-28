@@ -1,0 +1,313 @@
+#michael.s.denney@gmail.com
+##########################################################
+# scope_devs 
+# scope all the details for devs 
+#Michael.S.Denney@gmail.com
+my $VERSION=1.03;
+##########################################################
+#TO DO:
+##########################################################
+use common::sense;
+use Data::Dumper;
+use Getopt::Long;
+use Common;
+use Rpt;
+use Symmetrix;
+##################Global VARS#################################
+use vars qw($verbose $sid @header @error_header @rpt @errors);
+use vars qw($tab $mail_to $symcli $input_file $html);
+################## subs  #################################
+use subs qw(usage display_results display_error host_search push_to_rpt);
+use subs qw(SYMCLI_CONNECT display_tab sanitize_input display_html );
+use subs qw(prepare_html send_email make_excel excel_delete);
+##############################################################
+$Common::log_off=1;
+exit 1 unless GetOptions(
+                         'sym=s' => \$symcli,
+                         'm|mail=s' => \$mail_to,
+                         'f|file=s' => \$input_file,
+                         'html' => \$html,
+                         't|tab' => \$tab,
+                         's|sid=s' => \$sid,
+                         'v' => \$verbose
+               );
+unless ($sid){
+  print "Error: -sid xxx required\n";
+  usage ;
+}
+unless ($input_file or $ARGV[0] or -p STDIN){
+  print "Error: dev required\n";
+  usage ;
+}
+###################Global Path variables ###############
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path="$base/log";
+my $logfile="$log_path/$script.log";
+my $errlog="$log_path/$script.err_log";
+my $excel_file="/var/www/html/tmp/scope_devs_${sid}_$$.xls";
+my $html_excel=$excel_file; 
+$html_excel =~ s/\/var\/www\/html\///;
+#print "excel_file=$excel_file html_excel=$html_excel\n"; exit;
+@error_header=qw(SYMM DEV_NAME MESSAGE);
+@header=qw(DEV_NAME MEGABYTES DEV_STATUS DEV_CONFIG FA METAHEAD META_MEMBERS VIEWS STOR_GRP VIEW_INIT_GRP VIEW_PORT_GRP VIEW_STOR_GRP THIN_POOL DEV_WWN HOST_WWN SRDF_SERIAL SRDF_DEV RDFG RDF_STATE BCV_DEV BCV_DEV_STATUS BCV_PAIR_STATE BCV_STD_GRP BCV_ASC_GRP BCV_CG_GRP SCSI_STATUS);
+##############################################################
+#                  MAIN ()
+##############################################################
+my @devs=sanitize_input;
+my $sym=Symmetrix->new($sid);
+$sym->sid($sid);
+$sym->SYMCLI_CONNECT($symcli) if $symcli;
+if ($verbose){
+   $sym->verbose(1);
+   print 'SID '.$sym->sid."\n";
+   print 'CONNECT '.$sym->SYMCLI_CONNECT."\n";
+   print 'FAMILY '.$sym->model_family."\n";
+}
+unless ($sym->SYMCLI_CONNECT){
+   print "Unable to determine SYMCLI_CONNECT\n";
+   exit 1;
+}
+foreach my $dev (@devs){
+   my ($dev_info,$stderr)=$sym->dev_info($dev);
+   if (@$stderr){
+      #push @errors,[$sym->sid,$dev,$_] foreach (@$stderr);
+      display_error($dev,$stderr);
+      next;
+   }
+   #next if ($stderr);
+   unless ($$dev_info{DEV_CONFIG} =~/Meta Member/){
+           $$dev_info{HOST_WWN}=$sym->get_access($dev) ;
+       if ($sym->model_family =~ /VMAX/i){
+            $$dev_info{STOR_GRP}=$sym->vmax_sg_from_dev($dev);
+            foreach (@{$$dev_info{STOR_GRP}}){
+               $$dev_info{VIEWS}=$sym->determine_vmax_view($_,);
+               foreach my $view(@{$$dev_info{VIEWS}}){
+                  my $view_grps=$sym->show_vmax_view($view);
+                  $$dev_info{VIEW_INIT_GRP}="$view->$$view_grps{VIEW_INIT_GRP}";
+                  $$dev_info{VIEW_PORT_GRP}="$view->$$view_grps{VIEW_PORT_GRP}";
+                  $$dev_info{VIEW_STOR_GRP}="$view->$$view_grps{VIEW_STOR_GRP}";
+               }#foreach my $view(@{$$dev_info{VIEWS}}){
+            }#foreach (@{$$dev_info{STOR_GRP}}){
+       }#if ($sym->model_family =~ /VMAX/i){
+   }#unless ($$dev_info{DEV_CONFIG} =~/Meta Member/)
+   push_to_rpt($dev_info);
+   display_results($dev,$dev_info) unless ($tab or $html or $mail_to);
+}#foreach my $dev (@ARGV){
+#print Dumper $tab;
+display_tab if ($tab);
+my $rpt_object=Rpt->new;
+prepare_html if ($html or $mail_to);
+make_excel if ($mail_to or $html);
+print $rpt_object->email if ($html);
+excel_delete if ($html);
+send_email if ($mail_to);
+##############################################################
+#                  END MAIN ()
+##############################################################
+###########################################################################
+sub excel_delete{
+###########################################################################
+  my $cmd="echo \"rm -f $excel_file 2>/dev/null\" |at now +1 hour";
+  qx($cmd);
+}
+###########################################################################
+sub make_excel{
+###########################################################################
+   $rpt_object->excel_file($excel_file);
+   $rpt_object->excel_tabs("Scope Devs $sid",\@header,\@rpt);
+   $rpt_object->write_excel_tabs if ($rpt_object->excel_tabs);
+   chmod 777,$excel_file;
+   return 1;
+}
+###########################################################################
+sub send_email{
+###########################################################################
+   return undef unless (@rpt);
+   return undef unless ($rpt_object->email);
+   #say "sending email";
+   $rpt_object->email_attachment($excel_file);
+   $rpt_object->email_to($mail_to);
+   $rpt_object->email_from('SRT_Scope_Devs');
+   my $subject="Scope Devs array $sid";
+   $rpt_object->email_subject($subject);
+   $rpt_object->SendEmail unless ($mail_to eq 'none');
+   unlink $excel_file;
+}
+###########################################################################
+sub prepare_html{
+###########################################################################
+   return undef unless (@rpt);
+   my $outer_cnt=0;
+   foreach my $aref (@rpt){
+      foreach (@$aref){
+         my $inner_cnt=0;
+         my $cell_display;
+         if (ref $_ eq 'ARRAY')  {
+            foreach my $cell (@$_){
+             $cell_display.="$cell " ;
+            }
+            $$aref[$inner_cnt]=$cell_display;
+         }
+        $inner_cnt++;
+      }
+      $outer_cnt++;
+   }
+
+   my @eheaders;
+   $rpt_object->MakeEmailBodyHeaders("Scope Devs",'',\@eheaders) if $mail_to;
+   my @title=("Sym $sid ".$sym->model_family."  SYMCLI_CONENCT=".$sym->SYMCLI_CONNECT);
+      
+   push @title,"<a href=\"http://lpnoa0l3.pno-p01.chp.bankofamerica.com\/$html_excel\" target=_blank>Download Excel Version</a>";
+   $rpt_object->MakeEmailStatusHeaders('Green',\@title);
+   $rpt_object->MakeEmailBody(\@header,\@rpt);
+   $rpt_object->email('<Title>Scope Devs</Title>');
+   my @footers;
+   push @footers,"$Common::basename ver $VERSION";
+   return 1;
+
+}
+###########################################################################
+sub display_tab{
+###########################################################################
+   unshift @rpt,[@header];
+   foreach my $aref (@rpt){
+      foreach (@$aref){
+         if (ref $_ eq 'ARRAY')  {
+            foreach my $cell (@$_){
+               print "$cell " ;
+            }
+            print ';';
+            next;
+         }else{#if
+            print "$_;";
+         }
+      } 
+      print "\n";
+   }
+}
+##############################################################
+sub display_results{
+###########################################################################
+   my $dev=shift;
+   my $dev_info=shift;
+   #print Dumper(%$dev_info);
+   return undef unless (%$dev_info);
+   print "###############################################################\n";
+   print "DEV $dev SYM $sid ".$sym->model_family."  ".$sym->SYMCLI_CONNECT."\n";
+   print "###############################################################\n";
+   foreach (@header){
+      next unless $$dev_info{$_};
+      next if /^SYMM$/;
+      next if /^FAMILY$/;
+      print "$_=";
+      if (ref $$dev_info{$_}  eq 'ARRAY'){
+         foreach my $fa (@{$$dev_info{$_}}){
+            print "$fa " ;
+         }
+         print "\n";
+         next;
+      }
+     print "$$dev_info{$_}\n";
+   }
+}
+##############################################################
+sub display_error{
+###########################################################################
+   my $dev=shift;
+   my $stderr=shift;
+   return undef unless (@$stderr);
+   print "###############################################################\n";
+   print "DEV $dev SYM $sid ".$sym->model_family." ERROR\n";
+   print "###############################################################\n";
+   print "$_\n" foreach (@$stderr);
+}
+###########################################################################
+sub wwn_to_colon{
+###########################################################################
+   my @colons=shift;
+   foreach (@colons){
+      s/([A-Fa-f0-9]{2})/$1:/g;
+      s/:$//g;
+      #print "$_\n";
+   }
+   return @colons;
+}
+###########################################################################
+sub push_to_rpt{
+###########################################################################
+   my $dev_info=shift;
+   return undef unless ($dev_info);
+   my @line;
+   foreach my $key (@header){
+      my $cell=$$dev_info{$key};
+      if (ref $cell  eq 'ARRAY'){
+         my $new_cell;
+         foreach (@$cell){
+            $new_cell.="$_ " ;
+         }
+         $cell=$new_cell;
+      }#if (ref $$dev_info{$_}  eq 'ARRAY'){
+      #push @line,$$dev_info{$key}||' ';
+      push @line,$cell||' ';
+   }#foreach my $key (@header){
+   push @rpt,[@line];
+}
+###########################################################################
+sub sanitize_input{
+###########################################################################
+   my @input;
+   #@input=<>;# if (-t and -p STDIN);
+   @input=@ARGV if @ARGV;
+   if (-f $input_file){
+     open FH,"$input_file" or die "unable to open $input_file $!\n";
+     @input=(<FH>);
+     close FH,
+     chomp @input;
+   }
+   my @output;
+   foreach (@input){
+      my @line=split(/[,\s]+/,$_);
+      push @output,@line;
+   }
+   return (@output);
+}
+###########################################################################
+sub usage{
+###########################################################################
+print<<END;
+NAME
+     scope_devs - get details for symmetrix devs
+END  
+SYNOPSIS
+     scope_devs -sid <xxxx> <dev> [<dev> <dev> ..] [-t|--tab] [--html] [-m email][--sym xxx]
+     scope_devs -sid <xxxx> -f <file_name> [-t|--tab] [-m email] [--sym xxx]
+     piped_input| scope_devs -sid <xxxx> [-t|--tab] [-m email] [--html] [--sym xxx]
+DESCRIPTION
+     scope_devs gets and displays details for a list of symmertix devs given
+     in the the 4 digit hexadecimal format. The list of devices can be 
+     specified on the command line, a file or from a pipe. The list of devices
+     can be seperated by a whitespace,commas or newlines. 
+       Default output is to display one dev at a time with criteria one per 
+     line. Tabular output delimited by semi-colon can be alternatly specified 
+     with -t|--tab. If -m <email_address.com> is specified, the final output 
+     will be emailed in a spreadsheet. 
+OPTIONS
+     --sid serial 
+            Specify the symmetrix serial number to query.
+     -t|--tab 
+            Output in tabular format,delimited by semicolon.
+     -m|--mail
+            Email the results in a spreadsheet.
+     -f|--file
+            File with devs used for input
+     --html
+            Output to STDOUT in html
+     --sym 
+            Specify the SYMCLI_CONNECT string to use, instead of auto.
+
+END
+exit 1;
+}

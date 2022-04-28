@@ -1,0 +1,4 @@
+while true; do
+   /apps/srt/bin/make_symcli_info
+   sleep 42500
+done

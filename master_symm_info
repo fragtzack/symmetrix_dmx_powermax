@@ -1,0 +1,95 @@
+#Michael Denney
+#master_symm_info
+#Dumping the output into logins under each array directory
+#and a wwn-devs file for dev output
+################HISTORY#######################################
+my $version=1.1;
+#1.1 $count_logins updated
+###############################################################
+use common::sense;
+use File::Basename;
+use POSIX;
+use Data::Dumper;
+use FindBin;
+use Getopt::Long;
+use Common;
+use Symmetrix;
+###############################################################
+use subs qw(curr_time old_login at_job);
+use vars qw($verbose);
+my $num_concurrent=5;#num of concurrent at jobs to start in 1 session
+my $login_days=2;#num days to consider a login file old
+my $old_epoch=time-($login_days*86400);#The number to compare
+                                      #the file mtime with
+###############################################################
+$Common::log_off=1;
+my $name=getpwent;
+unless (getpwuid($>) =~ /^srt$/){
+   print "The program can only be ran by srt user\n";
+   exit 1;
+}
+exit 1 unless GetOptions(
+                         'v' => \$verbose
+               );
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $dirbase="$base/var/arrays";
+my $connectbase="$base/var/SYMCLI_CONNECT";
+my $log_path="$base/log";
+my $logfile="$log_path/$script.log";
+my $errlog="$log_path/$script.err_log";
+unless (-d $dirbase){
+   print "$dirbase does not exist, nothing to do\n";
+   exit 1;
+}
+###############################################################
+#    MAIN      
+###############################################################
+say $old_epoch if $verbose;
+my $cnt;
+my @logins = <$dirbase/*/logins>; 
+foreach (sort @logins){
+   #say $_;
+   if (old_login($_)){
+      at_job($_) unless ($cnt == $num_concurrent);
+      say "OLD, launching $_" if $verbose;
+      $cnt++;
+   }
+}
+###############################################################
+sub old_login{
+###############################################################
+   my $consider_file=shift;
+   my $mtime = (stat $consider_file)[9];
+   #say "file $consider_file mtime $mtime old_epoch $old_epoch" if $verbose;
+   return undef unless $mtime;
+   return undef if ($mtime > $old_epoch );
+   return 1;#file is old
+}
+###############################################################
+sub at_job{
+###############################################################
+   my $file=shift;
+   $file=~s/[\/]+/\//g;#change any double+ slashes to single slash
+   my @dirs=split('/',$file);
+   my $sid=$dirs[scalar @dirs-2];
+   my $sym=Symmetrix->new($sid);
+   my $symcli=$sym->SYMCLI_CONNECT;
+   unless ($symcli){
+     say "ERROR unable to determine SYMCLI_CONNECT for old $sid";
+     return undef;
+   }
+  my $cmd="echo \"/apps/srt/bin/get_one_symm_info -sid $sid --SYMCLI_CONNECT $symcli >> $logfile 2>/dev/null\" |at now";
+  my @stdout=qx($cmd);
+  my $job=join @stdout;
+  say "at job $job started for $sid SYMCLI_CONNECT=$symcli" if $verbose;
+}
+###############################################################
+sub curr_time{
+###############################################################
+   my ($lwday,$lmon,$lmday,$lhour,$lmin,$lsec,$lyear,$ltz)= split(/ /,strftime "%a %b %d %H %M %S %Y %Z",localtime());
+   #print "$lhour:$lmin $ltz $lmday $lmon $lyear\n";
+   return "$lhour:$lmin $ltz $lmday $lmon $lyear";
+}

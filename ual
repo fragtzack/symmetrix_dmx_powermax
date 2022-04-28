@@ -1,0 +1,73 @@
+#michael.s.denney@gmail.com
+##########################################################
+# ual
+# User Account Lookup at 
+# http://wsuapps.bankofamerica.com/userlookup/scripts/userlookup.pl
+#Michael.S.Denney@gmail.com
+#curl --data "byID=nbkbvva" http://wsuapps.bankofamerica.com/userlookup/scripts/userlookup.pl
+my $VERSION=1.01;
+##########################################################
+#TO DO:
+##########################################################
+use common::sense;
+use Data::Dumper;
+use Getopt::Long;
+##################Global VARS#################################
+use vars qw($email $nbkid $name);
+################## subs  #################################
+use subs qw(usage);
+##############################################################
+exit 1 unless GetOptions(
+                         'm=s' => \$email,
+                         'i=s' => \$nbkid,
+                         'n=s' => \$name
+);
+usage unless ($email or $nbkid or $name);
+###########################################################################
+##             MAIN 
+###########################################################################
+#name='byEMAIL
+#name='byNAME
+my $seach;
+my $search="byID=$nbkid" if $nbkid;
+$search="byEMAIL=$email" if $email;
+$search="byNAME=$name" if $name;
+my @labels=qw(nbkid first_name mid_name last_name email mail_code phone_num home_dir hierarchy);
+my $cmd="curl -s --data $search http://wsuapps.bankofamerica.com/userlookup/scripts/userlookup.pl";
+my @txt_results=qx($cmd);
+chomp @txt_results;
+my $cnt=0;my $found;
+while (<@txt_results>){
+   #print "LINE = $_\n";
+   if ($cnt == 6){
+       if (/^size=1>([0-9a-zA-Z\.\@\-\\]*)$/){
+           #print "LINE = $_ COUNT=$cnt\n";
+           print "$labels[$cnt]=$1\n";
+           $cnt++;
+           next;
+       }
+   }
+   if (/^size=1>([0-9a-zA-Z\.\@\-\\]*)&nbsp/){
+     #print "LINE = $_ COUNT=$cnt\n";
+     print "$labels[$cnt]=$1\n";
+     $cnt++;
+     print "###################################\n" if $cnt == 9;
+     $cnt=0 if $cnt == 9;
+   }
+}
+
+
+###########################################################################
+sub usage{
+###########################################################################
+print<<END;
+NAME
+     ual - User Account Lookup
+                     Lookup user account at http://wsuapps.bankofamerica.com/userlookup/scripts/userlookup.pl 
+SYNOPSIS
+     ual -i <nbk id>
+     ual -m <email>
+     ual -n <last_name,first_name>
+END
+exit 1
+}

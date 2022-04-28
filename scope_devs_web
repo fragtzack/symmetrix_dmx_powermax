@@ -1,0 +1,147 @@
+#michael.s.denney@gmail.com
+##########################################################
+# scope_devs.pl html display wrapper
+# get dev info from a SID using solutions enabler
+#Michael.S.Denney@gmail.com
+my $VERSION=1.01;
+##########################################################
+#TO DO:
+##########################################################
+use common::sense;
+use Data::Dumper;
+use Common;
+use Rpt;
+use CGI;
+use CGI::Carp qw(fatalsToBrowser);
+use Env;
+##################Global VARS#################################
+my $form;my $host_search;
+################## subs  #################################
+use subs qw(print_env print_form scope_devs print_html_head);
+use subs qw(sanity_check);
+##############################################################
+$Common::log_off=1;
+$|=1;
+#exit 1 unless ($ARGV[0]);
+my $host_search=$ARGV[0];
+#$host_search=~s/hname=//g;
+#print "Content-Type: text/plain \n\n";
+#print "\n $host_search \n\n";
+#exit;
+$form=<<END;
+<a href="http://lpnoa0l3.pno-p01.chp.bankofamerica.com">srt</a></br>
+<form action="scope_devs.pl" method="get">
+<table border="0">
+    <tr>
+        <td>
+            SID: <input type="text" name="SID" size="4">
+        </td>
+        <td>
+            DEVS: <input type="text" name="DEVS" size="150">
+        </td>
+        <td>
+            optional SYMCLI_CONNECT: <input type="text" name="SYMCLI" size="10">
+        </td>
+    </tr>
+    <tr>
+        <td>
+            <input type="submit" value="scope_devs">
+        </td>
+    </tr>
+</table>
+</form>
+END
+#3<p>$OUTPUT</p>
+#my $form='<a href="http://lpnoa0l3.pno-p01.chp.bankofamerica.com">srt</a></br>'; $form.='<form METHOD=GET ><input type="submit" value="SID"> <input name="SID" ></form>';
+#$form.='<form METHOD=GET ><input type="submit" value="DEVS"> <input name="DEVS" ></form>';
+my %input;
+my $cgi = new CGI;
+for my $key ( $cgi->param() ) {
+    $input{$key} = $cgi->param($key);
+}
+my $rpt_object=Rpt->new;
+sanity_check unless ($input{SID} =~ /print_env/i);;
+print_env if ($input{SID} =~ /print_env/i);
+scope_devs if (defined $input{SID} and defined $input{DEVS});
+#########################################################################
+sub scope_devs{
+#########################################################################
+#my $host_search=shift;
+my $cmd="/usr/local/bin/scope_devs --sid $input{SID} --html $input{DEVS}";
+$cmd.=" --sym $input{SYMCLI}" if ($input{SYMCLI});
+print_html_head;
+print "Fetching dev info...\n</br>";
+print "$cmd\n</br>";
+#print "<img border=\"0\" src=http://lpnoa0l3.pno-p01.chp.bankofamerica.com/images/loading.gif alt=image here></br>";
+my ($stdout,$stderr)=run_cmd($cmd);
+#print "STDOUT HERE\n</BR>";
+foreach (@$stdout){
+   print "$_";
+}
+foreach (@$stderr){
+   print "$_";
+}
+print qq{</body></html>};
+exit 1 unless (@$stdout);
+exit;
+}
+#########################################################################
+sub print_html_head{
+#########################################################################
+my @eheaders;
+$rpt_object->MakeEmailBodyHeaders("Scope Devs",'',\@eheaders);
+$rpt_object->email($form);
+print $rpt_object->email;
+}
+#########################################################################
+sub print_env{
+#########################################################################
+#print qq{Content-type: text/html
+
+#<html><head></head><body>
+#};
+print_html_head;
+
+foreach my $key (sort (keys %ENV)) {
+    print $key, ' = ', $ENV{$key}, "<br>\n";
+}
+
+for my $key ( keys %input ) {
+    print $key, ' = ', $input{$key}, "<br>\n";
+}
+print qq{</body></html>};
+exit;
+}
+#########################################################################
+sub print_form{
+#########################################################################
+print qq{Content-type: text/html
+
+<html><head></head><body>
+};
+  print qq{<form METHOD=GET ><input type="submit" value="Find Host">
+<input name="hname" ></form>};
+print qq{</body></html>};
+exit;
+}
+#########################################################################
+sub sanity_check{
+#########################################################################
+    my @error_messages;
+ #print "sanity check!\n</br>";
+    if (! $input{SID} and ! $input{DEVS}){ 
+        print_html_head;
+        exit;
+    }
+    unless ($input{SID}=~/\d{4,}/){
+       push @error_messages,"SID of 4+ digits required";
+    }
+    unless ($input{DEVS}=~/[a-fA-F0-9\s,]{4,}/){
+      push @error_messages,"Hexadecimal DEVS of exactly 4 chars required";
+    }
+    if (@error_messages){
+        print_html_head;
+        print "$_\n</BR>" foreach @error_messages;
+        exit 1;
+    }
+}

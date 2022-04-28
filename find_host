@@ -1,0 +1,405 @@
+#michael.s.denney@gmail.com
+##########################################################
+# find_host
+# find wwn info for host by searching various databases
+#Michael.S.Denney@gmail.com
+my $VERSION=1.01;
+##########################################################
+#TO DO:
+##########################################################
+use common::sense;
+use Data::Dumper;
+use Getopt::Long;
+use Env;
+use DBI;
+use Common;
+use Rpt;
+##################Global VARS#################################
+use vars qw($print_sql $host_h @found_wwns $verbose $csv);
+use vars qw($host_search $sql_query %devs);
+use vars qw(@host_search_rpt @host_search_logins);
+use vars qw(@host_search_others_rpt @host_search_rpt_header);
+my @found_wwns_header=('HOSTNAME','WWN','ACTIVE','SOURCE');
+my @host_logins_header=('SER','WWN','NODE','PORT','LOGIN','FAB','TIME_STAMP');
+################## subs  #################################
+use subs qw(get_rpt usage display_results dwh_storage_query);
+use subs qw(oci_query host_search dwh_masters_query get_srdb);
+##############################################################
+$Common::log_off=1;
+GetOptions(
+          'c' => \$csv,
+          'v' => \$verbose
+);
+usage unless ($ARGV[0]);
+$host_search=$ARGV[0];
+###################Global Path variables ###############
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path="$base/log";
+my $logfile="$log_path/$script.log";
+my $errlog="$log_path/$script.err_log";
+##############################################################
+#                  MAIN ()
+##############################################################
+$sql_query=oci_query;
+$host_h=get_rpt('OCI','dbi:ODBC:DWH','dwh','sanscreen',$sql_query);
+load_host_rpt($host_h);
+$sql_query=dwh_masters_query;
+$host_h=get_rpt('DWH_MASTERS','dbi:ODBC:SRDB','storage_user','storagesql',$sql_query);
+load_host_rpt($host_h);
+$sql_query=dwh_storage_query;
+$host_h=get_rpt('DWH_STORAGE','dbi:ODBC:SRDB','storage_user','storagesql',$sql_query);
+load_host_rpt($host_h);
+get_srdb;
+my ($cmd,$host_logins)=host_search if (@found_wwns);
+unless (@found_wwns){
+   print "No WWN info Found\n" ;
+   exit 1;
+}
+display_results(\@found_wwns_header,\@found_wwns);
+   print "##################################################################\n";
+   print "# $cmd\n";
+   print "##################################################################\n";
+if (@$host_logins){
+   display_results(\@host_logins_header,$host_logins);
+}
+if (@host_search_rpt){
+   print "##################################################################\n";
+   print "# DEVS MASKED TO THE WWNS LISTED ABOVE\n";
+   print "##################################################################\n";
+   display_results(\@host_search_rpt_header,\@host_search_rpt);
+}
+if (@host_search_others_rpt){
+   print "##################################################################\n";
+   print "# DEVS LISTED ABOVE ALSO USED BY OTHER WWNS BELOW\n";
+   print "##################################################################\n";
+   display_results(\@host_search_rpt_header,\@host_search_others_rpt);
+}
+if (%devs){
+   print "##################################################################\n";
+   print "# Just the symm->devs\n";
+   print "##################################################################\n";
+   foreach (sort keys %devs){
+      print "$_->";
+      foreach my $dev (@{$devs{$_}}){
+          print "$dev " 
+      }
+      print "\n";
+   }
+}
+##############################################################
+#                  END MAIN ()
+##############################################################
+###########################################################################
+sub display_results{
+###########################################################################
+   my $header=shift;
+   my $body=shift;
+   unshift @$body,[@$header];
+   my %formats;
+   my %dups;
+   #print Dumper(@$body);
+   foreach my $aref (@$body){ ###find longest string in each array element
+      my $pos=0;
+      foreach (@$aref){
+         $formats{$pos}=length $_ if (length $_ > $formats{$pos});
+         $pos++;
+      }
+   }  
+   #print Dumper(%formats);
+   my $row=0;
+   foreach my $aref (@$body){
+      my $pos=0;
+      next if ($dups{$$aref[0]}{$$aref[1]}{$$aref[2]}{$$aref[3]});
+      $dups{$$aref[0]}{$$aref[1]}{$$aref[2]}{$$aref[3]}=1;
+      foreach (@$aref){
+         if ($row == 0){
+            printf "%-$formats{$pos}s ",uc $_;
+         }else{
+            printf "%-$formats{$pos}s ",lc $_;
+         }
+         $pos++;
+      }
+      $row++;
+      print "\n";
+   }
+}
+###########################################################################
+sub clean_srdb{
+###########################################################################
+  my $host_info=shift;
+  my %host_h;
+  foreach my $hostN (keys %{$host_info}){
+     foreach (keys %{$$host_info{$hostN}}){
+        #say ">$_<";
+        my $orig=$_;
+        next if /^$/;
+        next if /^disk\s*$/i;
+        next if /^tape\s*$/i;
+        next if ((/tape/i)&&(!/disk/i));
+        $_=~s/HBA for local//gi;
+        $_=~s/EMC//gi;
+        $_=~s/\(//g;
+        $_=~s/\)//g;
+        $_=~s/\\//g;
+        $_=~s/\///g;
+        $_=~s/\-//g;
+        $_=~s/\://g;
+        $_=~s/\.//g;
+        $_=~s/node/ /ig;
+        $_=~s/server/ /ig;
+        $_=~s/tape/ /ig;
+        $_=~s/spare/ /ig;
+        $_=~s/new/ /ig;
+        $_=~s/npiv/ /ig;
+        $_=~s/WWNs/ /ig;
+        $_=~s/wwn/ /ig;
+        $_=~s/info/ /ig;
+        $_=~s/\r+/ /g;
+        $_=~s/\n+/ /g;
+        $_=~s/disk/ /i;
+        #$_=~s/^\s+//gi;
+        #$_=s/[g-zG-Z]//gi;
+        my @line=split /\s+/,$_;
+        foreach my $wwn (@line){
+           #say $wwn; 
+           next unless (length $wwn == 16);
+           $host_h{$hostN}{$wwn}{source}=$$host_info{$hostN}{$orig}{source};
+           $host_h{$hostN}{$wwn}{status}=$$host_info{$hostN}{$orig}{status};
+        }
+     }#foreach (keys %{$$host_info{$hostN}}){
+  }#foreach my $hostN (keys %$host_info){
+  #print Dumper (%$host_info);
+  return \%host_h;
+}
+###########################################################################
+sub get_srdb{
+###########################################################################
+   my %srdb_rpt;
+   foreach ('Slot0_WWN','Slot1_WWN','Slot2_WWN','Additional_HBA_WWN_Info'){
+      $sql_query=srdb_query($_);
+      $host_h=get_rpt('SRDB_techweb','dbi:ODBC:SRDB','TechwebRead','techweb1read',$sql_query);
+      return undef unless (%$host_h);
+      $host_h=clean_srdb($host_h);
+      load_host_rpt($host_h);
+   }
+}
+###########################################################################
+sub load_host_rpt{
+###########################################################################
+  my $host_info=shift;
+  #print Dumper(%$host_info);
+  foreach my $hostN (keys %$host_info){
+     next unless defined $hostN;
+     foreach (keys %{$$host_info{$hostN}}){
+        next if ($$host_info{$hostN}{$_}{source} =~ /dwh_storage/);
+        push @found_wwns,[
+                        $hostN,
+                        $_,
+                        $$host_info{$hostN}{$_}{status},
+                        $$host_info{$hostN}{$_}{source}
+                        ];
+     }#foreach (keys %{$$host_info{$hostN}}){
+  }#foreach my $hostN (keys %$host_info){
+  #print Dumper(%$host_info);
+  #print Dumper(@found_wwns);
+}
+###########################################################################
+sub get_rpt{
+###########################################################################
+  my $source=shift;
+  my $DSN=shift;
+  my $username=shift;
+  my $auth=shift;
+  my $query=shift;
+  my %host_info;
+  say "getting $source wwn info" if $verbose;
+  my $dbh = DBI->connect($DSN,$username,$auth,{ RaiseError => 0, AutoCommit => 0 });
+  unless ($dbh){
+    print "Failed to connect to $DSN\n";
+    return undef;
+  }
+  my $sth = $dbh->prepare($query);
+  $sth->{LongReadLen}=1024;
+  $sth->{LongTruncOk}=1;
+  my $rv = $sth->execute;
+  unless ($rv) {
+    print ERROR with sql-> $dbh->errstr."\n";
+    return undef;
+  }
+   #say $query;exit;
+   while (my $ref = $sth->fetchrow_hashref) {
+     #print Dumper (%$ref);
+     unless ($$ref{host}){
+       print "host name not detected, skipping row\n" if $verbose;
+       next;
+     }
+     #print "HOST = >$$ref{host}<\n";
+     #print "WWN = >$$ref{wwn}<\n";
+     unless ($$ref{wwn}=~/[0-9a-zA-Z]/){
+       print "wwn not detected, skipping row\n" if $verbose;
+       next;
+     }
+     $$ref{wwn}=~s/://g;
+     $host_info{$$ref{host}}{$$ref{wwn}}{source}=$source;
+     $host_info{$$ref{host}}{$$ref{wwn}}{status}=$$ref{status}||'na';
+   }#end while my $ref = $sth->fetchrow_hashref
+   $sth->finish;
+   $dbh->rollback;
+   $dbh->disconnect;
+   #print Dumper(%host_info);
+   unless (%host_info){
+      print "$source host info not found\n" if $verbose;
+      return undef;
+   }
+   return \%host_info;
+}
+###########################################################################
+sub wwn_to_colon{
+###########################################################################
+   my @colons=shift;
+   foreach (@colons){
+      s/([A-Fa-f0-9]{2})/$1:/g;
+      s/:$//g;
+      #print "$_\n";
+   }
+   return @colons;
+}
+###########################################################################
+sub dwh_storage_query{
+###########################################################################
+my  $host_query=<<END;
+SELECT xgm_his_data_serverData.dsd_serverName AS host,
+       xgm_his_data_serverWwn.dsw_wwn AS wwn,
+       xgm_his_data_serverWwn.dsw_wwnStatus AS status
+  FROM    Storage.dbo.xgm_his_data_serverWwn xgm_his_data_serverWwn
+       INNER JOIN
+          Storage.dbo.xgm_his_data_serverData xgm_his_data_serverData
+       ON (xgm_his_data_serverWwn.dsw_serverId =
+              xgm_his_data_serverData.dsd_serverId)
+ WHERE (UPPER (xgm_his_data_serverData.dsd_serverName) LIKE
+           UPPER ('%$host_search%'))
+END
+#print "$host_query\n";
+return $host_query;
+}
+###########################################################################
+sub dwh_masters_query{
+###########################################################################
+my  $host_query=<<END;
+SELECT DISTINCT
+       xgm_his_data_serverData.dsd_serverName AS host,
+       xgm_his_data_serverWwn_masters.dswm_wwn AS wwn,
+       xgm_his_data_serverWwn_masters.dswm_wwnStatus AS status
+  FROM    Storage.dbo.xgm_his_data_serverData xgm_his_data_serverData
+       INNER JOIN
+          Storage.dbo.xgm_his_data_serverWwn_masters xgm_his_data_serverWwn_masters
+       ON (xgm_his_data_serverData.dsd_serverId =
+              xgm_his_data_serverWwn_masters.dswm_serverId)
+ WHERE (UPPER (xgm_his_data_serverData.dsd_serverName) LIKE
+           UPPER ('%$host_search%'))
+END
+#print "$host_query\n";
+return $host_query;
+}
+###########################################################################
+sub oci_query{
+###########################################################################
+my  $host_query=<<END;
+SELECT DISTINCT host.name AS host,
+       host_port.wwn,
+       host_port.active AS status
+    FROM    dwh_inventory.host_port host_port
+       INNER JOIN
+          dwh_inventory.host host
+       ON (host_port.hostId = host.id)
+   WHERE (UPPER(host.name) LIKE UPPER('%$host_search%'))
+END
+#print "$host_query\n";
+return $host_query;
+}
+###########################################################################
+sub srdb_query{
+###########################################################################
+my  $wwn_query=shift;
+my  $host_query=<<END;
+SELECT DISTINCT StorageReqs_Server.Server_Name AS host,
+                  StorageReqs_Server.$wwn_query AS wwn
+  FROM Techweb.dbo.StorageReqs_Server StorageReqs_Server
+ WHERE (UPPER (StorageReqs_Server.Server_Name) LIKE
+           UPPER ('%$host_search%'))
+END
+#print "$host_query\n";
+return $host_query;
+}
+###########################################################################
+sub host_search{
+###########################################################################
+   say "getting host_search info" if $verbose;
+   my %wwns;
+   foreach my $aref (@found_wwns){
+     foreach (@$aref){
+        $wwns{lc $$aref[1]}=1 unless ($$aref[3] =~ /dwh_storage/i);
+     }
+   }
+   #print Dumper(%wwns);exit;
+   return undef unless (%wwns);
+#Identifier       Type  Node Name        Port Name        FCID   In     Fabric
+   #@host_logins_header=('host_search logins');
+   my $string;
+   $string.="$_ " foreach (keys %wwns);
+   my $cmd="/usr/local/bin/host_search $string";
+   say $cmd if $verbose;
+   my ($stdout,$stderr)=run_cmd($cmd);
+   if (@$stderr){
+      open ERR,">/tmp/err.out";
+      print ERR "host_search ERR $_\n" foreach (@$stderr); 
+      close ERR;
+      say "host_search ERR $_" foreach (@$stderr); 
+      return undef;
+   }
+   my $listed;
+   foreach (@$stdout){
+     $listed=1 if /DEVS LISTED ABOVE/; 
+     #say $_;
+     if (/^(\d+)\/logins:([0-9A-Za-z]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+=>(.+$)/){
+         my @stamp=split /\s+/,$9;
+         my $stamp="$stamp[1]_$stamp[2]_$stamp[4]";
+         push @host_search_logins,[$1,$2,$4,$5,$7,$8,$stamp];
+         next;
+     }
+     $_=~s/ M //g;
+     if (/^(\d+)\/wwn-devs:([0-9A-Za-z]+)\s+(\S+)\s+([0-9A-Za-z,:]+)\s([A-Z]*)\s*(\d+)\s+=>(.+)/){
+         my @stamp=split /\s+/,$7;
+         my $stamp="$stamp[1]_$stamp[2]_$stamp[4]";
+         if ($listed){
+            push @host_search_others_rpt,[$1,$2,$3,$4,$5,$6,$stamp] ;
+            #say "pushing host_search_others";
+            next;
+         }
+         #say "pushing host_search";
+         push @host_search_rpt,[$1,$2,$3,$4,$5,$6,$stamp];
+         push @{$devs{$1}},$3;
+     }
+   }#foreach
+   @host_search_rpt_header=qw(SER WWN DEV DIRPORT CAPACITY STAMP);
+   #print Dumper(@host_search_logins);
+   #print Dumper(@host_search_others_rpt);exit;
+   #print Dumper(@host_search_rpt);exit;
+   $cmd=~s/\/usr\/local\/bin\///g;
+   $cmd=~s/-l//g;
+   return(return $cmd,\@host_search_logins);
+}
+###########################################################################
+sub usage{
+###########################################################################
+print<<END;
+NAME
+     find_host - search multiple sources for storage wwn.
+SYNOPSIS
+     find_host <hostname> 
+END
+exit 1
+}

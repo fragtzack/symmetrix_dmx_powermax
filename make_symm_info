@@ -1,0 +1,376 @@
+#Michael Denney
+#Make directory structure of symm arrays.
+#Each array to have a directory created with
+#directory name being the last 4 serials # of the array.
+
+#Then create a listing of logins for each array.
+#Dumping the output into logins under each array directory
+################HISTORY#######################################
+my $version=1.8;
+#1.1 $count_logins updated
+#1.2 fixed get_wwn_devs not picking up 3 char directors
+#1.3 fixed vmax devs listing too many devs
+#1.4 changed base dir to be dynamic
+#    script runs from ~/reclaim/bin now
+#    removed hard references to "~/decomm" path 
+#1.5 Added keeping track of time taken to get logins+devs and 
+#    record time in serial directory/get-logins-time.time=seconds elasped
+#1.6 Keeping track of time is now in single file-> directory/perf
+#       directory/perf shall have 1 line per possible SYMCLI_CONNECT
+#       with the number of seconds in the first field
+#       ,the SYMCLI_CONNECT name 2nd field and the epoch time stamp third
+#       example: 6 TX2XPVLXAH 912923123
+#1.7 Move to lpnoa013 
+#1.8 Added remove_perf sub
+###################PREPARE FOR RUN ############################
+use common::sense;
+use File::Basename;
+use File::stat;
+use POSIX;
+use Net::Ping;
+use Data::Dumper;
+use FindBin;
+use subs qw(curr_time get_symcli get_logins get_wwn_devs);
+use subs qw(get_vmax_devs update_perf);
+
+my $logins_count=0;
+#my ($script,$script_path)=fileparse($0);
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path="$base/log";
+my $logfile="$log_path/$script.log";
+my $errlog="$log_path/$script.err_log";
+my $dirbase="$base/var/arrays";
+my $connectbase="$base/var/SYMCLI_CONNECT";
+#print "base_dir=$script_path my logfile = $logfile\n";exit;
+open LOG,">$logfile" or print "unable to open $logfile\n";
+print LOG curr_time." STARTING\n";
+mkdir ($base,0755 ) unless ( -d $base);
+unless (-d $dirbase){
+   mkdir ($dirbase,0755 )or die "Unable to mkdir $dirbase $!\n";
+}
+my $syms=get_symcli;
+my $symcli_count;
+###############################################################
+#@$syms=('crprdngap0r','TX2XPVLX28','TX2XPVLX29');
+#@$syms=('TX2XPVLXAF');
+foreach my $SYM (@$syms){
+   print "$connectbase/$SYM\n";
+   open (SYMFILE,"<$connectbase/$SYM") or warn "Unable to open $connectbase/$SYM $!\n";
+   my @sym_stdout=(<SYMFILE>);
+   close SYMFILE;
+   chomp @sym_stdout;
+   unless (grep /S Y M M E T R I X/,@sym_stdout){ 
+      open ERR,">>$errlog";
+      print ERR curr_time." $_\n" foreach (@sym_stdout);
+      close ERR;
+      print LOG curr_time." ERROR $_\n" foreach (@sym_stdout);
+      next;
+   }
+   $symcli_count++;
+   #open SYM_OUT,">$connectbase/$SYM" or die curr_time." unable to open $connectbase/$SYM $!\n";
+   print "SYMCLI_CONNECT=$SYM\n";
+   print LOG curr_time." SYMCLI_CONNECT=$SYM\n";
+   foreach my $sym_line (@sym_stdout){
+      #print SYM_OUT "$sym_line\n";
+      #print "$sym_line\n";
+      next if ($sym_line=~ /^\s*$/);
+      ###skip all lines except sym lines,last 4 nums of serial to $1
+      ###only using syms that are local
+      next unless ( $sym_line=~ /^\s+\d{8}(\d{4})\sLocal\s+([\w-]+)/ );
+      my $serial=$1;
+      my $model=$2;
+      print "serial=>$serial model=>$model\n";
+      #next unless ($serial eq '0220');
+      next unless get_logins($SYM,$serial);
+      get_vmax_devs($SYM,$serial) if ( $model =~ /VMAX/);
+      get_wwn_devs($SYM,$serial) unless ( $model =~ /VMAX/);
+   #close SYM_OUT;
+   }#foreach @sym_line @sym_stdout
+} #'foreach my $SYM
+my $complete_date=curr_time;
+#my $cmd="echo \"$symcli_count symcli_connect, $logins_count symms updated\"|mail -s \"$complete_date-make_symm_info\" michael.denney\@bankofamerica.com";
+#my $cmd="echo \"$symcli_count symcli_connect, $logins_count logins updated\"|mail -s \"$complete_date-make_symm_info\" DG.SBEO_Storage_Reclamation\@bankofamerica.com\@bankofamerica.com";
+#$cmd="echo \"$script $symcli_count symcli_connect, $logins_count symms updated\"|mail -s $complete_date-make_symm_info dg.ETD_STI_HSDB_SAN_Reclamation\@bankofamerica.com";
+#system($cmd);
+exit;
+###############################################################
+sub curr_time{
+###############################################################
+   my ($lwday,$lmon,$lmday,$lhour,$lmin,$lsec,$lyear,$ltz)= split(/ /,strftime "%a %b %d %H %M %S %Y %Z",localtime());
+   #print "$lhour:$lmin $ltz $lmday $lmon $lyear\n";
+   return "$lhour:$lmin $ltz $lmday $lmon $lyear";
+}
+###############################################################
+sub get_symcli{
+###############################################################
+   #my $slow_connects="$base/slow-symcli-connects";
+   #my %slow_connects;
+   #open SLOW,"$slow_connects" or die "Unable to open $slow_connects";
+   #while (<SLOW>) {
+      #chomp;
+      ##print "$_\n";
+      #$slow_connects{$_}=1;
+   #}
+   #close SLOW;
+   unless (-d $connectbase){
+     print "Unable to find directory $connectbase $!\n";
+     exit 2;
+   }
+   opendir(DIR,"$connectbase");
+   my @sym_files=readdir(DIR);
+   closedir(DIR);
+   chomp @sym_files;
+   my @syms;
+   foreach (@sym_files){
+     #print "$_\n";
+     #push @syms,$_ unless ($slow_connects{$_});
+     push @syms,$_ ;
+   }
+   #print Dumper(@syms);
+   return (\@syms);
+}
+###############################################################
+sub get_logins{
+###############################################################
+      my $SYM=shift;
+      my $serial=shift;
+      print curr_time." considering $SYM SERIAL=>$serial\n";
+      print LOG curr_time." considering $SYM SERIAL=>$serial\n";
+      unless (-d "$dirbase/$serial") {
+         print curr_time." making $dirbase/$serial\n";
+         print LOG curr_time." making $dirbase/$serial\n";
+         mkdir ("$dirbase/$serial", 0755) or warn "Unable to mkdir $dirbase/$serial $!\n";
+      }
+      print curr_time." login file=>$dirbase/$serial/logins\n";
+      print LOG curr_time." login file=>$dirbase/$serial/logins\n";
+=cut
+      if (-f "$dirbase/$serial/logins"){
+         #print "logins already exists\n";
+         if ((time - stat("$dirbase/$serial/logins")->mtime) < 60*480){
+             print curr_time." skipping $dirbase/$serial/logins  =>less then 8  hours old\n";
+             print LOG curr_time." skipping $dirbase/$serial/logins  =>less then 8 hours old\n";
+             return undef;
+         }
+      }
+=cut
+      #print curr_time." Skipping logns for test\n";next;
+      my $cmd="SYMCLI_CONNECT=$SYM /usr/symcli/bin/symmask list logins -sid $serial";
+      #print "$cmd\n";
+      my $before_run_time=time;
+      my @stdout=qx($cmd);
+      my $after_run_time=time;
+      my $run_time=$after_run_time-$before_run_time;
+      if (@stdout){
+         chomp @stdout;
+         open F_LOGIN,">$dirbase/$serial/logins" or warn "Unable to open $dirbase/$serial/logins $!\n";
+         foreach my $line (@stdout){
+           print F_LOGIN "$line\n"; 
+         }
+         close F_LOGIN;
+         $logins_count++;
+         update_perf($SYM,$serial,$run_time,time);
+         return 1;
+      } else {
+         remove_perf($SYM,$serial);
+         print curr_time." Error getting logins for $SYM $serial\n";
+         print LOG curr_time." Error getting logins for $SYM $serial\n";
+         return undef;
+      } #if @stdout
+      return 1;
+}#end sub;
+###############################################################
+sub get_wwn_devs{
+###############################################################
+     my $SYM=shift;
+     my $serial=shift;
+      print curr_time." dmx dev file=>$dirbase/$serial/wwn-devs\n";
+      print LOG curr_time." dmx dev file=>$dirbase/$serial/wwn-devs\n";
+      my $cmd="SYMCLI_CONNECT=$SYM /usr/symcli/bin/symmaskdb -sid $serial list devs";
+      #my $cmd='cat /var/tmp/devdecomm/arrays/0817/devs.in';
+      my @stdout=qx($cmd); chomp @stdout;
+      #open FH,"/var/tmp/devdecomm/arrays/0817/devs.in";
+       #my @stdout=<FH>;close FH;chomp @stdout;
+      
+
+      my @wwn_lines;my $dev_line;my $dev_line_cnt=0;my $i=0;
+      my @dir_ports;
+      if (@stdout){
+         #print curr_time." wwn-dev file=>$dirbase/$serial/wwn-devs\n";
+         open F_DEVS,">$dirbase/$serial/wwn-devs" or warn "Unable to open $dirbase/$serial/wwn-devs$!\n";
+        @stdout=reverse(@stdout);
+        foreach (@stdout){
+           $i++;
+           next if /^\s*$/; next if /Sym Dev/; next if /^Name/;
+           next if /--/;next if /User-generated/;next if /Symmetrix/;
+           #print "$_\n";
+           if (/Originator Port wwn : (\w+)/){ 
+              my $wwn=$1;
+              if (@wwn_lines){
+                 print F_DEVS "$wwn $_\n" foreach @wwn_lines; 
+                 #print "$wwn $_\n" foreach @wwn_lines; 
+                 undef @wwn_lines;
+              }
+              #}else {print F_DEVS "$wwn\n";}
+              next;
+           }
+           if (/^\s+(\w+:\w)\s+/){
+               push @dir_ports,$1;
+               next;
+           }
+           if (/^(\w\w\w\w)\s+(\w+:\w)\s+/){
+               push @dir_ports,$2;
+              my @devline=split /\s+/,$_;
+              if ($devline[-2] eq "(M)"){
+                 $devline[-1]=' M '.$devline[-1];
+              }
+              my $dir_ports=join ",", @dir_ports;
+              $dev_line="$1 $dir_ports ".$devline[-1];
+              push @wwn_lines,$dev_line;
+              undef @dir_ports;
+           }
+           undef $dev_line;
+        }#foreach @stdout
+        close F_DEVS;
+      } #if @stdout
+      return 1;
+}#end sub
+###############################################################
+sub get_vmax_devs{
+###############################################################
+     my $SYM=shift;
+     my $serial=shift;
+      print curr_time." vmax dev file=>$dirbase/$serial/wwn-devs\n";
+      print LOG curr_time." vmax dev file=>$dirbase/$serial/wwn-devs\n";
+      my $cmd="SYMCLI_CONNECT=$SYM /usr/symcli/bin/symaccess -sid $serial list devinfo";
+      #my $cmd='cat list.out';
+      my @stdout=qx($cmd); chomp @stdout;
+      my @wwns;my @wwn_lines;my $dev_line;my $dev_line_cnt=0;my $i=0;
+      my $no_more_wwn;my @dir_ports;my $curr_dev;my $capacity;
+      if (@stdout){
+         print curr_time." wwn-dev file=>$dirbase/$serial/wwn-devs\n";
+         open F_DEVS,">$dirbase/$serial/wwn-devs" or warn "Unable to open $dirbase/$serial/wwn-devs$!\n";
+        foreach (@stdout){
+           next if /^\s*$/;next if /^Initiator/;next if /^Last/;
+           next if /^\s+Host/;next if /\s(\{|\})/;next if /^\s+IG/;
+           next if /\s+----/;next if /^(^\s+Sym|^\s+Dev)/;next if /^Symmetrix/;
+           #print "$_\n";
+           $i++;
+           if (/\s+(WWN)\s+:([\w_]+)$/){
+              push @wwns,$2; next;
+           }
+           if (/^\s+(\w+:\w+)\s+/){ ##port line with no dev
+              push @dir_ports,$1; next;
+           }
+           if (/^\s+(\w\w\w\w)\s+(\w+:\w)/){
+              if ($curr_dev){
+                 my $dir_ports=join ",",@dir_ports;
+                 push @wwn_lines,"$curr_dev $dir_ports $capacity";
+                 undef @dir_ports;undef $capacity;
+              }
+              $curr_dev=$1;
+              my @devline=split /\s+/,$_;
+              $capacity=$devline[-2];
+              if ($devline[-3] eq "(M)"){
+                 $capacity="M $capacity";
+              }
+              push @dir_ports,$2;
+              next;
+           }
+           if ((/^\s+Total Capacity/)&&($curr_dev)){
+              my $dir_ports=join ",",@dir_ports;
+              push @wwn_lines,"$curr_dev $dir_ports $capacity";
+              foreach my $wwn (@wwns){
+                 #print "wwn $wwn ";
+                 print F_DEVS "$wwn $_\n" foreach (@wwn_lines);
+                 #print "$wwn $_\n" foreach (@wwn_lines);
+              }
+              undef $curr_dev;undef @dir_ports;undef $capacity;
+              undef @wwns;undef @wwn_lines;
+           }#if $Total Capacity
+        }#foreach @stdout
+        close F_DEVS;
+      } #if @stdout
+      return 1;
+exit;
+}#end sub
+###############################################################
+sub update_perf{
+###############################################################
+  my $SYM=shift;
+  $SYM=lc $SYM;
+  my $serial=shift;
+  my $run_time=shift;
+  my $time_stamp=shift;
+  my %perfs;
+  $perfs{$SYM}{run_time}=$run_time;
+  $perfs{$SYM}{time_stamp}=$time_stamp;
+  #print "IN update_perf rtime=>$run_time sym->$SYM time_stamp->$time_stamp\n";
+  my $perf_file="$dirbase/$serial/perf";
+  if (-f $perf_file){
+     open PERF,"$perf_file" or warn "Unable to open $perf_file";
+     my @perf=<PERF>;
+     close PERF;
+     chomp @perf;
+     foreach my $perf_line (@perf){
+        #print "FILE LINE = $perf_line\n";
+        my ($rtime,$sym,$tstamp)=split (/\s+/,$perf_line);
+        #print "SPLIT LINE = rtime->$rtime sym->$sym time_stamp->$tstamp\n";
+        ##make sure the input line has all 3 fields
+        next unless $rtime;next unless $sym;next unless $tstamp;
+        $sym=lc $sym;
+        ##discard the entry in file for SYM because
+        ##   the data passed to this sub is most recent
+        next if ($SYM eq $sym);
+        ##detect if multiple entries(for odd reasons) exists in file
+        ##keep the most recent timestmap
+        if ( $perfs{$sym} ){
+           if ($tstamp < $perfs{$sym}{time_stamp} ){
+              next;
+           }#end if ($time_stamp > $perfs{$sym}{time_stamp} )
+        }#end if ( $perfs{$sym} )
+        $perfs{$sym}{run_time}=$rtime; 
+        $perfs{$sym}{time_stamp}=$tstamp; 
+     }#end foreach @perf_line
+  } else {
+     print "perf file not detected\n";
+  }#end else
+     open PERF,">$perf_file" or warn "Unable to open $perf_file";
+     foreach (keys %perfs){
+        #print "NEW FILE=$perfs{$_}{run_time} $_ $perfs{$_}{time_stamp}\n";
+        print PERF "$perfs{$_}{run_time} $_ $perfs{$_}{time_stamp}\n";
+     }
+     close PERF;
+}#end sub
+###############################################################
+sub remove_perf{
+###############################################################
+  my $SYM=shift;
+  $SYM=lc $SYM;
+  my $serial=shift;
+  my @perfs;
+  my $perf_file="$dirbase/$serial/perf";
+  return unless (-f $perf_file);
+  print "removing $SYM\n";
+  if (-f $perf_file){
+     open PERF,"$perf_file" or warn "Unable to open $perf_file";
+     my @perf=<PERF>;
+     close PERF;
+     chomp @perf;
+     foreach (@perf){
+        my @line=split /\s+/;
+        push @perfs,$_ unless ($line[1]=~/$SYM/i);
+        #print "$_\n" unless ($line[1]=~/$SYM/i);
+     }
+  }
+     open PERF,">$perf_file" or warn "Unable to open $perf_file";
+     foreach (@perfs){
+        #print "NEW FILE=$perfs{$_}{run_time} $_ $perfs{$_}{time_stamp}\n";
+        print PERF "$_\n";
+     }
+     close PERF;
+     return;
+}
+###############################################################

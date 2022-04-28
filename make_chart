@@ -1,0 +1,30 @@
+#michael.s.denney@gmail.com
+  #$cc->write_output('/mnt/srt/foo.png');
+use common::sense;
+use Chart::Lines;
+#my $chart=Chart::Lines->new;
+my $chart=Chart::Lines->new(900,600); #pixels
+my @x_vals=qw (Jan Feb Mar Apr May Jun Jul Aug Sep Oct Nov Dev);
+my @san_vals=qw (50 120 130 149  14 515 1114 123 132 550 688 131);
+my @nas_vals=qw (50 120 130 149  14 515 1114 123 132 550 688 131);
+$chart->add_dataset(@x_vals);
+$chart->add_dataset(@san_vals);
+$chart->add_dataset (@nas_vals);
+
+my %chart_attribs = ('legend_labels' => ['SAN Closed','NAS Closed'],
+'y_axes' => 'both',
+'title' => 'Storage reclaims',
+'grid_lines' => 'true',
+'legend' => 'left',
+'legend_example_size' => 20,
+'brush_size' => 10,
+'colors' => {'text' => 'blue',
+             'misc' => 'blue',
+             'background' => 'grey',
+             'grid_lines' => 'light_blue',
+             'dataset0' => [220,0,0],
+             'dataset1' => [200,0,100]
+             }
+);
+$chart->set(%chart_attribs);
+$chart->png('/mnt/srt/foo.png');

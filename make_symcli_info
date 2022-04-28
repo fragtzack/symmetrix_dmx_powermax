@@ -1,0 +1,136 @@
+#Michael.s.Denney@gmail.com
+#Make directory structure of symcli_connect info.
+#each symcli_connect= will be a file name
+#with the output of symcfg list inside the file
+
+use common::sense;
+use File::Basename;
+use File::stat;
+use File::Copy;
+use FindBin;
+use POSIX;
+use Data::Dumper;
+use Common;
+use Rpt;
+
+my $version=1.0;
+use vars qw(@err_rpt);
+use subs qw(curr_time archive send_email);
+###################PREPARE FOR RUN ############################
+my $mail_to='michael.denney@bankofamerica.com';
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path="$base/log";
+mkdir ($log_path,0755 ) unless ( -d $log_path);
+my $logfile="$log_path/$script.log";
+my $errlog="$log_path/$script.err_log";
+mkdir ("$base/var",0755 ) unless ( -d "$base/var");
+my $dirbase="$base/var/arrays";
+mkdir ($dirbase,0755 ) unless ( -d $dirbase);
+my $connectbase="$base/var/SYMCLI_CONNECT";
+mkdir ($connectbase,0755 ) unless ( -d $connectbase);
+my $archive_dir="$connectbase/archive";
+open LOG,">>$logfile" or die "unable to open $logfile\n";
+print LOG curr_time." STARTING\n";
+#qx/rm -fr $dirbase/ if (-d $dirbase);
+#qx/rm -fr $connectbase/ if (-d $connectbase);
+unless (-d $archive_dir){
+   mkdir ($archive_dir,0755 )or die "Unable to mkdir $archive_dir $!\n";
+}
+my $bad_sym_file="$base/etc/bad_sym_cli";
+###############################################################
+archive;
+my $symcmd='awk \'{print $1}\' /var/symapi/config/netcnfg';
+my @syms=qx/$symcmd/;
+chomp @syms;
+open FH,"$bad_sym_file";
+my @bad_syms=(<FH>);
+close FH;
+chomp @bad_syms;
+my %bad_syms;
+$bad_syms{lc $_}=1 foreach (@bad_syms);
+print Dumper(%bad_syms);
+#@syms=qw(sgusbkp1);
+my $symcli_count;
+#print "$_\n" foreach @syms;
+###############################################################
+foreach my $SYM (@syms){
+   next if ($bad_syms{lc $SYM});
+   #my @sym_stdout=qx(SYMCLI_CONNECT=$SYM /usr/symcli/bin/symcfg list);
+      say "#######################################";
+      say "LISTING $SYM";
+      say "#######################################";
+   my ($stdout,$stderr)=run_cmd("SYMCLI_CONNECT=$SYM /usr/symcli/bin/symcfg list");
+   unless (grep /S Y M M E T R I X/,@$stdout){ 
+      open ERR,">>$errlog";
+      print ERR "ERROR with $SYM\n";
+      print ERR "#######################################\n";
+      print ERR "$_\n" foreach (@$stderr);
+      close ERR;
+      push @err_rpt,"ERROR with $SYM";
+      push @err_rpt,say "#######################################";
+      push @err_rpt,$_ foreach (@$stderr);
+      say "ERROR with $SYM";
+      say "#######################################";
+      say $_ foreach (@$stderr);
+      next;
+   }
+   $symcli_count++;
+   open SYM_OUT,">$connectbase/$SYM" or die curr_time." unable to open $connectbase/$SYM $!\n";
+   print "SYMCLI_CONNECT=$SYM\n";
+   print LOG curr_time." SYMCLI_CONNECT=$SYM\n";
+   foreach my $sym_line (@$stdout){
+      print SYM_OUT "$sym_line\n";
+      #print "$sym_line\n";
+   } #foreach @sym_stdout , big loop
+
+   close SYM_OUT;
+} #foreach my $SYM
+my $complete_date=curr_time;
+#my $cmd="echo \"$symcli_count symcli_connect symms updated\"|mail -s $complete_date-make_symcli_info michael.denney\@bankofamerica.com";
+#my $cmd="echo \"$symcli_count symcli_connect symms updated\"|mail -s $complete_date-make_symcli_info DG.SBEO_Storage_Reclamation\@bankofamerica.com";
+#system($cmd);
+send_email if ($mail_to);;
+exit;
+###############################################################
+sub send_email{
+###############################################################
+   my $rpt_obj=Rpt->new;
+   $rpt_obj->email_to($mail_to);
+   $rpt_obj->email_from('make_symcli_info');
+   $rpt_obj->email_subject('make smcli_connect info '.`date`);
+   $rpt_obj->email("Failed connections:<BR><BR>");
+   $rpt_obj->email("$_<BR>") foreach (@err_rpt);
+   $rpt_obj->SendEmail unless ($mail_to eq 'none');
+}
+###############################################################
+sub curr_time{
+###############################################################
+   my ($lwday,$lmon,$lmday,$lhour,$lmin,$lsec,$lyear,$ltz)= split(/ /,strftime "%a %b %d %H %M %S %Y %Z",localtime());
+   #print "$lhour:$lmin $ltz $lmday $lmon $lyear\n";
+   return "$lhour:$lmin $ltz $lmday $lmon $lyear";
+}
+###############################################################
+sub archive{
+###############################################################
+    my $curr_time=time;
+    my $cut_off_time=$curr_time-(86400*7); #7 days
+    #my $cut_off_time=(86400*3); #3 days
+    opendir DIR,$connectbase or warn "Unable to read $connectbase\n";
+    #while (my $file=readdir (DIR)){
+    my @files=readdir (DIR);
+    close DIR;
+    foreach my $file(@files){
+      next unless (-f "$connectbase/$file"); #skip directories
+      my $file_time=stat("$connectbase/$file")->mtime;
+      next if ($file_time > $cut_off_time);
+      print "Archiving $connectbase/$file\n";
+      print LOG curr_time." Archiving $connectbase/$file\n";
+      move("$connectbase/$file",$archive_dir) or die "The move operation failed: $!";
+      #print "cut_off_time=>$cut_off_time mtime=>$file_time\n";
+    }#end while
+ 
+}
+###############################################################

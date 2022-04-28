@@ -1,0 +1,1164 @@
+##########################################################
+# tracker.pl
+# Query the SRDB and produce a spreadsheet
+# and html output
+#Michael.S.Denney@gmail.com
+my $VERSION=5.91;
+##########################################################
+#TO DO:
+#       multiple tabs for excel spreadsheet
+#Version history
+#1.1 Disk tech queries
+#1.2 StorageReqs_Storage_Request.Request_Status = Rejected
+#     now overwrites all colors with yellow
+#1.3 Serial number now correctly reports in spreadsheet
+#1.4 map_wwn now reports if input is missing keyword disk
+#1.5 added "Reclaim Factory" to growth type condition
+#1.6 map_wwpns-next if /tape/ and !/disk/
+#1.7 wwpns column populated from StorageReqs_Server.NAS_NDMP_Mount_Points
+#    if StorageReqs_Request_Component.Connectivity_Type = "Network Attached"
+#1.8 CRR columns added - sub map_disk_notes2
+#1.9 -s srdb option added
+#2.0 total-weekly reports
+#2.1 disk tech reports
+#2.2 add "Factory Reclaim" to WHERE clause
+#2.3 fixed=NDMP Mounts field not updating WWPNS
+#2.4 fixed Rejected and DELETE coloring to yellow
+#2.5 added space between the totals tables
+#    add @footer displaying version
+#2.6 Fixed color of closed comps
+#2.7 Swap AIT and Org columns
+#    move Status column to after F/P column
+#    move Masters column to after Status column
+#2.8 Growth_Type added
+#2.9 GB reclaimed only counted if Growth_Type = reclaim or reclaim factory
+#3.1 Added columns 
+#3.2 port counts made more accurate by only counting a server once
+#3.3 port counts look for CRR Complete = has a date
+#3.4 Switch Name and Ports columns added
+#3.5 -r|--rpt option added to count arrays
+#3.6 arrays names are all lower case, added @older_arrays
+#3.7 setting of LD_LIBRARY_PATH needed by freetds
+#3.8 -rpt option is perm
+#3.9 add SSE column
+#3.91 --silent
+#4.0 Switch ports and data center now determined from storage_info DB
+#    csv file
+#4.1 Added --sql option to print the srdb sql used and exit
+#     load_switch_info now puts DUPLICATES in the switch name + ports
+#     if the same wwn is deteched twice in the switch db
+#4.2 No more emails, instead produces html with file download link
+#4.3 file_copies sub
+#4.4 removed printing to stdout DUPLICATE verbage for switch_info
+#4.6 Comp_LOB added
+#4.7 Fixed LOB_rpt file copies/permissions
+#4.8 Added SSE team tracker options
+#4.9 SSE team tracker enhancements
+#4.91 map_Additional_Comp_Info looks for \r or \n now
+#4.92 sql query now only queries for reclaim/reclaim factory
+#4.93 $html_out printing fixed 
+#4.94 lob_rpt now only reports on CTO
+#4.95 split SRDB.Comp into 2 variables
+#4.96 move sa_tracker column
+#5.01 exclude techs from spash screen reports,multiple tabs in excel
+#5.11 %monthly
+#5.21 integration with DTT database for sa_tracker column
+#5.23 removal of last 7 days space screen,changed to curr month
+#     remove ports from splash screen
+#5.33 sql now grabs all "factor_reclaim" OR "reclaim"+disk_techs
+#5.35 sql now grabs comp_reject_date and reject date calcs fixed
+#5.37 date calculations are now skipped for a comp where a manual date entry
+#     is in invalid date format
+#5.39 Monthly excel tab no longer shows rows with no data for a month
+#5.49  year to date column %year_to_date on summary splash screen
+#5.59  color changes, added light green for SDR:wd
+#5.61  set_row_format
+#5.81  fixed sql for getting reclaim factory where disk tech = null
+#5.91  added disk_type column and AIT now comes from Comp
+##########################################################
+use common::sense;
+use Data::Dumper;
+use Getopt::Long;
+use Time::Local;
+use Env;
+use DBI;
+use File::Copy;
+use Rpt;
+use Common;
+#######ARGV command line variables get opts###################
+my $verbose=0;my $debug=0;my $mail_to;my $mail_to_cmd;
+my $open=0;my $closed=0;my $srdb_num=0;my $rptflag=1;
+my ($print_sql,$print_html,$dev,$silent,$team);
+GetOptions(
+          'r|rpt' => \$rptflag,
+          's=i' => \$srdb_num,
+          'silent' => \$silent,
+          'v' => \$verbose,
+          'd' => \$debug,
+          'm=s' => \$mail_to_cmd,
+          'sql' => \$print_sql,
+          'html' => \$print_html,
+          't|team=s' => \$team,
+          'dev' => \$dev
+);
+##################Global VARS#################################
+use vars qw(@rpt @error_rpt @email_rpt @rpt_headers $mail_to);
+use vars qw(%users_where %users_map %formats %arrays);
+use vars qw($total_closed $total_gb_reclaimed $total_ports_reclaimed);
+use vars qw($total_open $total_created);
+use vars qw($ports_pending $total_delete $total_rejected);
+use vars qw(%switch_info %lob_info @lob_rpt);
+use vars qw(%team %team_techs %team_where %monthly %year_to_date);
+my ($sec,$min,$hour,$mday,$mon,$year,$wday,$yday,$isdst)=localtime(time);$mon++;
+my $curr_yr_start=timelocal(00,00,00,1,0,$year);
+my $full_year=1900+$year;
+
+#print "curr epoch ".time." curr year $year\n";exit;
+$total_closed=$total_gb_reclaimed=0;
+$total_open=$total_created=0;
+$total_delete=$total_rejected=0;
+
+my %configs=read_config('/usr/local/etc/tracker.conf');
+####team configs if -t or --team
+my $teamfile="/usr/local/etc/team-".lc $team.".conf" if $team;
+%team=read_config($teamfile) if ($team);
+#rpt_file,lob_file and excel_file are the tmp files created
+my $excel_file="/tmp/tracker.xls";
+$excel_file="/tmp/$team\_tracker.xls" if $team;
+my $html_dir='/var/www/html/tracker';
+$html_dir='/var/www/html/devtracker' if $dev;
+my $html_out=$html_dir.'/tracker_report.html';
+my $update_form=$html_dir.'/update_form.html';
+my $index=$html_dir.'/index.html';
+my $share_dir='/mnt/srt/shared/Shared Documents';
+my $share_tracker=$share_dir.'/tracker.xls';
+$share_tracker=$share_dir.'/devtracker.xls' if $dev;
+my $team_share_tracker;
+if ($team){
+   $team_share_tracker=$share_dir."/$team\_tracker.xls";
+   $team_share_tracker=$share_dir."/$team\_devtracker.xls" if $dev;
+}
+my $tracker_xls=$html_dir.'/tracker.xls';
+$tracker_xls=$html_dir.'/devtracker.xls' if $dev;
+$tracker_xls=$html_dir."/$team\_tracker.xls" if $team;
+$tracker_xls=$html_dir."/dev_$team\_tracker.xls" if ($team and $dev);
+##################Predeclare SUBS#############################
+use subs qw(map_Additional_Comp_Info select_query map_wwpns);
+use subs qw(from_query where_query order_query send_email);
+use subs qw(load_techs rpt_headers map_nas map_crr dtt);
+use subs qw(email_rpts load_switch_info file_copies team_file_copies);
+use subs qw(gb_to_tb);
+##############SANITY CHECKS AND PREPS#########################
+#$ENV{LIBRARY_PATH}='/usr/local/lib';
+##############################################################
+
+$verbose=1 if ($debug);
+my %techs;
+foreach (@ARGV){
+   $techs{lc $_}=1;
+}
+###########################################################################
+##convert all %configs keys to lower case
+%configs = map { lc $_ => $configs{$_} } keys %configs; 
+say "CONFIGS=>" if $debug;
+print Dumper(%configs) if $debug;
+%techs=parse_team(\%configs) unless (%techs);
+%users_where=load_techs(\%techs,\%configs);
+unless (%users_where){
+    say "No reclaim disk techs located in tracker.conf"; exit 1;
+}
+if ($team){
+   %team= map { lc $_ => $team{$_} } keys %team if $team; 
+   %team_techs=parse_team(\%team);
+   %team_where=load_techs(\%team_techs,\%team);
+}
+$mail_to=$mail_to_cmd if ($mail_to_cmd);
+unless ($mail_to) {say "Unable to determine email recipient. aborting";exit 1;}
+say "mail_to=>$mail_to" if $verbose;
+#$mail_to='michael.denney@bankofamerica.com';
+
+load_switch_info;
+my $dtt_servers=dtt;#load servers info from dtt
+#print Dumper (%$dtt_servers);
+
+my $data_source='ODBC:SRDB';
+my $username='TechwebRead';
+my $auth='techweb1read';
+
+my $dbh = DBI->connect('dbi:ODBC:SRDB',$username,$auth,{ RaiseError => 1, AutoCommit => 0 });
+unless ($dbh){
+  print "Failed to connect\n";
+  exit 1;
+}
+
+my $select_query=select_query;
+my $from_query=from_query;
+my $where_query=where_query;
+my $order_query=order_query;
+my $query=$select_query.$from_query.$where_query.$order_query;
+if ($print_sql) {
+    say $query;
+    exit;
+}
+
+my $sth = $dbh->prepare($query);
+$sth->{LongReadLen}=180;
+my $rv = $sth->execute;
+unless ($rv) {
+  print ERROR with sql-> $dbh->errstr."\n";
+  exit 1;
+}
+
+my $row_cnt=0;
+ while (my $ref = $sth->fetchrow_hashref) {
+   #print "$_\n" foreach (keys %$ref);
+   #print $ref->{'SRDB.Comp'}." ".$ref->{'Additional_Comp_Info'}."\n";
+   #next if ($ref->{'SRDB'} < 12000);
+   #next unless ($ref->{'SRDB'} == 15251);
+   #print "SRDB=> $ref->{'SRDB'} COMP=>$ref->{'Comp'}\n";
+   #say "ADR=> $$ref{ADR}";
+   $$ref{'Comp Status'}=~s/Capacity Reserved/Capacity_Reserved/;
+   my $add_info=map_Additional_Comp_Info($$ref{'Additional_Comp_Info'});
+   my $crr_info=map_disk_notes2($$ref{'Disk_Notes2'});
+   #say "after map_disk_notes2";exit;
+   my $wwpns;
+   $wwpns=map_wwpns($ref)||' ' unless ($$ref{'Disk Product'} eq 'Network Attached');
+   my $switch_display=map_switch_info($wwpns,$crr_info) unless ($$ref{'Disk Product'} eq 'Network Attached');
+   $wwpns=map_nas($ref)||' ' if ($$ref{'Disk Product'} eq 'Network Attached');
+   if (lc $$dtt_servers{lc $$ref{'Server Name'}}){
+      my $txt;
+      $txt=$$dtt_servers{lc $$ref{'Server Name'}}{stage}||' ';
+      $txt.='-';
+      $txt.=$$dtt_servers{lc $$ref{'Server Name'}}{power_down}||' ';
+      $$add_info{sa_tracker}=$txt;
+   }
+   #print Dumper(%$comp_info_hash);
+   $row_cnt++;##first row is header, so increment before add to @rpt
+   push @rpt,[
+              $$ref{'Scheduled'}||' ',
+              $$ref{'SRDB'}||' ',
+              $$ref{'Comp'}||' ',
+              $$ref{'Nexus'}||' ',
+              $$add_info{'org'}||' ',
+              $$ref{'Server Name'}||' ',
+              $$ref{'Alloc'}||' ',
+              $$ref{Disk_Type}||' ',
+              $$ref{'Disk Subsystem'}||' ',
+              $$ref{'Serial'}||' ',
+              $users_where{$$ref{'Disk Tech'}}{short}||$$ref{'Disk Tech'}||' ',
+              $$add_info{'sdr'}||' ',
+              $$add_info{'f_p'}||' ',
+              $$add_info{'status'}||' ',
+              $$add_info{'sa_tracker'}||' ',
+              $$dtt_servers{lc $$ref{'Server Name'}}{tech}||' ',
+              $$add_info{'masters'}||' ',
+              $$ref{'Management Console'}||' ',
+              $wwpns,
+              $$switch_display{'switch_name'}||' ',
+              $$switch_display{'loc'}||' ',
+              $$switch_display{'port'}||' ',
+              #$$crr_info{'switch'}||' ',
+              #$$crr_info{'ports'}||' ',
+              $$add_info{'crr'}||' ',
+              $$add_info{'submit'}||' ',
+              $$crr_info{'sent'}||' ',
+              $$crr_info{'complete'}||' ',
+              $$add_info{'zoning'}||' ',
+              $$ref{'Comp_Create_Date'}||' ',
+              $$ref{'Target_Impl_Date'}||' ',
+              $$add_info{'fms_server'}||' ',
+              $$ref{'AIT'}||' ',
+              $$add_info{'follow_up'}||' ',
+              $$ref{'Contact'}||' ',
+              $$ref{'SSE_Name'}||' ',
+              $$ref{'Last Update'}||' ',
+              $$ref{'Last Updated by'}||' ',
+              $$ref{'Disk Product'}||' ',
+              $$ref{'Comp Status'}||' ',
+              $$ref{ADR}||' ',
+              $$ref{'Comp Complete'}||' ',
+              $$ref{'Growth_Type'}||' ',
+              $$ref{'Comp LOB'}||' ',
+              $$add_info{'notes'}||' '
+             ];
+#next unless ($$ref{'SRDB.Comp'} =~ /12078\.1/);
+             say "SRDB comp=>$$ref{Comp} Request_Status=>$$ref{'Comp Status'}<=" if $debug;
+             unless ($lob_info{$$ref{'Comp LOB'}}){
+                   $lob_info{$$ref{'Comp LOB'}}{pending}=0;
+                   $lob_info{$$ref{'Comp LOB'}}{pending_cnt}=0;
+                   $lob_info{$$ref{'Comp LOB'}}{closed}=0;
+                   $lob_info{$$ref{'Comp LOB'}}{closed_cnt}=0;
+             }
+             #say "Comp Status=>".$$ref{'Comp Status'};
+           set_row_format($ref,$add_info);
+           email_rpts($ref,$add_info,$crr_info);
+ }#end while my $ref = $sth->fetchrow_hashref
+#print Dumper(@rpt);
+#print Dumper(%lob_info);
+
+$sth->finish;
+$dbh->rollback;
+$dbh->disconnect;
+
+my @dmx4_arrays;my @vmax_arrays;my @all_arrays;
+my $dmx4_reclaimed=0;my $dmx4_pending=0;
+my $vmax_reclaimed=0;my $vmax_pending=0;
+my $older_reclaimed=0;my $older_pending=0;
+foreach my $array (keys %arrays){
+   if ($array =~ /vmax/i){
+      push @vmax_arrays,[$array,$arrays{$array}{reclaimed}||0,$arrays{$array}{pending}||0];
+      $vmax_reclaimed+=$arrays{$array}{reclaimed}||0;
+      $vmax_pending+=$arrays{$array}{pending}||0;
+      next;
+   }; 
+   if ($array =~ /dmx4/i){
+      push @dmx4_arrays,[$array,$arrays{$array}{reclaimed}||0,$arrays{$array}{pending}||0];
+      $dmx4_reclaimed+=$arrays{$array}{reclaimed}||0;
+      $dmx4_pending+=$arrays{$array}{pending}||0;
+      next;
+   }; 
+   push @all_arrays,[$array,$arrays{$array}{reclaimed}||0,$arrays{$array}{pending}||0];
+      $older_reclaimed+=$arrays{$array}{reclaimed}||0;
+      $older_pending+=$arrays{$array}{pending}||0;
+}
+
+unshift (@all_arrays,@dmx4_arrays);
+unshift (@all_arrays,@vmax_arrays);
+#print Dumper(@all_arrays);exit;
+foreach my $lob (keys %lob_info){
+   #print "$lob ";
+   #print $lob_info{$lob}{pending_cnt}.' ';
+   #print $lob_info{$lob}{pending}."\n";
+   #print $lob_info{$lob}{closed_cnt}.' ';
+   #print $lob_info{$lob}{closed}."\n";
+   next unless (grep /CTO/,$lob);
+   push @lob_rpt,[
+                  $lob,
+                  $lob_info{$lob}{pending_cnt},
+                  $lob_info{$lob}{pending},
+                  $lob_info{$lob}{closed_cnt},
+                  $lob_info{$lob}{closed},
+                 ];
+}
+$total_gb_reclaimed=sprintf("%.2f",$total_gb_reclaimed);
+gb_to_tb;
+send_email;
+exit;
+###########################################################################
+sub set_row_format{
+###########################################################################
+  my $ref=shift;
+  my $add_info=shift;
+  if ($$add_info{'sdr'} =~ /^\s*y\s*$/i){
+  #say "setting row $row_cnt orange for $$ref{SRDB} $$ref{Comp}";
+  #say "setting row $row_cnt orange" if $debug;
+  $formats{$row_cnt}{'all'}{'bg_color'}='orange_bg';
+     if (($$ref{'Comp Status'} =~ /Capacity_Reserved/i) or 
+         ($$ref{'Comp Status'} =~ /New/i)) {
+        $lob_info{$$ref{'Comp LOB'}}{pending}+=$$ref{'Alloc'};
+        $lob_info{$$ref{'Comp LOB'}}{pending_cnt}++;
+     }
+
+  }
+  if ($$ref{'Comp Status'} =~ /Closed/i){
+     #say "setting row $row_cnt light green" if $debug;
+     #$formats{$row_cnt}{'all'}{'bg_color'}='light_green_bg';
+     say "setting row $row_cnt green" if $debug;
+     $formats{$row_cnt}{'all'}{'bg_color'}='green_bg';
+     $lob_info{$$ref{'Comp LOB'}}{closed}+=$$ref{'Alloc'};
+     $lob_info{$$ref{'Comp LOB'}}{closed_cnt}++;
+  }
+  if ($$add_info{'sdr'} =~ /^\s*(wd)\s*$/i){
+     say "setting row $row_cnt green" if $debug;
+     $formats{$row_cnt}{'all'}{'bg_color'}='light_green_bg';
+  }
+  if ($$ref{'Comp Status'} =~ /(Rejected|DELETE)/i){
+     say "setting row $row_cnt yellow" if $debug;
+     $formats{$row_cnt}{'all'}{'bg_color'}='yellow_bg';
+  }
+   unless ($$ref{'Comp Status'} eq 'New' or $$ref{'Comp Status'}  eq 'Capacity_Reserved'){
+     $formats{$row_cnt}{all}{hide}=1;
+   }
+}
+###########################################################################
+sub map_switch_info{
+###########################################################################
+   my %switch_display;
+   my $wwns=shift;
+   my $crr_info=shift;
+   my @wwns=split('[\s]+',lc $wwns);
+   foreach (@wwns){
+      #$_=~s/^......//g;
+      #print "searching for $_ \n";
+      if ($switch_info{$_}){
+         my $switch_name=$switch_info{$_}{switch_name}||' ';
+         my $port=$switch_info{$_}{port}||' ';
+         my $loc=$switch_info{$_}{loc}||' ';
+         $switch_display{switch_name}.=$switch_name.' ';
+         $switch_display{port}.=$port.' ';
+         $switch_display{loc}=$loc unless $switch_display{loc};
+      }
+   }
+   if ($$crr_info{'switch'} =~ /\w+/){
+      $switch_display{switch_name}=$$crr_info{'switch'};
+   }
+   if ($$crr_info{'ports'} =~ /\w+/ ){
+     $switch_display{port}=$$crr_info{'ports'};
+   }
+=cut
+   foreach (keys %switch_display){
+      print "$_ => ";
+      print $switch_display{$_};
+      print "\n";
+   }
+=cut
+   return \%switch_display;
+}
+###########################################################################
+sub load_switch_info{
+###########################################################################
+   #say "loading switch info";
+   my $csv_file='/apps/srt/tracker/var/switch_info/db/switch_info.csv';
+   open CFILE ,  $csv_file or die "Unable to open $csv_file$!\n";
+   while (<CFILE>){
+      chomp;
+      my ($switch_name,$loc,$port,$wwn)=split(',',lc $_);
+      next unless $switch_name;  ##next 4 lines
+      next unless $loc;          ##are in case of invalid
+      next unless $port;         ##entries in the line
+      next unless $wwn;          ##from switch_info.csv
+      #Check if there is duplicate entry for a wwn
+      if ($switch_info{$wwn}{switch_name}){
+          $switch_info{$wwn}{switch_name}='DUPLICATE WWN RECORDS';
+          $switch_info{$wwn}{loc}='DUPLICATE WWN RECORDS';
+          $switch_info{$wwn}{port}='DUPLICATES';
+          #say "load_switch_info- Duplicates for $wwn";
+          next;
+      }
+      $switch_info{$wwn}{switch_name}=$switch_name;
+      $switch_info{$wwn}{loc}=$loc;
+      $switch_info{$wwn}{port}=$port;
+      #print "$switch_name - $loc - $wwn\n";
+      #$switch_info{$wwn}{status}=$status;
+      #$switch_info{$wwn}{update}=$update;
+   }
+   close CFILE;
+   #say $_ foreach (keys %switch_info);
+}
+###########################################################################
+sub date_to_epoch{
+###########################################################################
+    my $date=shift;
+    my @line=split /\//,$date;
+    my $mon=$line[0]; $mon--;
+    my $mday=$line[1];
+    my $year=$line[2];
+    return undef unless ($date =~ /\d+\/\d+\/\d+/);
+    #print "\ndate=>$date";
+    #print " mon=>$mon mday=>$mday year=>$year ";
+    #my $time = timelocal(59,59,23,$mday,$mon,$year);
+    my $time = timelocal(00,00,00,$mday,$mon,$year);
+    #say "epoch=>$time";
+    return $time;
+}
+my %server_port_counted;
+my %pending_server_port_counted;
+my %weekly_server_port_counted;
+###########################################################################
+sub email_rpts{
+###########################################################################
+#monthly{year}{month}{partial_comps_open}
+#monthly{year}{month}{full_comps_open}
+#monthly{year}{month}{total_comps_open}
+#monthly{year}{month}{partial_comps_closed}
+#monthly{year}{month}{full_comps_closed}
+#monthly{year}{month}{total_comps_closed}
+#monthly{year}{month}{san_reclaim}
+#monthly{year}{month}{nas_reclaim}
+#monthly{year}{month}{total_reclaim}
+#$monthly{year}{month}{created}
+#$monthly{year}{month}{rejected}
+#$monthly{year}{month}{deleted}
+   my $ref=$_[0];
+   my $add_info=$_[1];
+   my $crr_info=$_[2];
+   return unless (($$ref{'Growth_Type'} eq 'Reclaim')||
+      ($$ref{'Growth_Type'} eq 'Reclaim Factory'));
+   #my $week_epoch=time-(8*86400);#note 8 days
+    #print "Comp Status=>$$ref{'Comp Status'} Alloc=>$$ref{'Alloc'} ";
+   $total_created++;
+   my $epoch=date_to_epoch($$ref{'Comp_Create_Date'});
+   if ($epoch){ 
+      my ($s,$mi,$h,$m,$mo,$y,$w,$ye,$i)=localtime($epoch);$mo++;
+      $monthly{$y}{$mo}{created}++;
+      $year_to_date{created}++ if ($epoch > $curr_yr_start);
+   }
+   #print "just added to created $monthly{$y}{$mo}{created}\n";
+   #$weekly_created++ if ($epoch > $week_epoch);
+   if (uc $$ref{'Comp Status'} eq uc 'DELETE'){
+       $total_delete++;
+       return;
+   }
+   if ($$ref{'Comp Status'} eq 'Rejected'){
+       $total_rejected++;
+           my $reject_epoch=date_to_epoch($$ref{comp_reject_date});
+           if (($reject_epoch) and ($reject_epoch > $curr_yr_start)){
+       #say "SRDB.comp=>$$ref{SRDB} $$ref{Comp} reject date=>$$ref{comp_reject_date}";
+              $year_to_date{rejected}++ 
+           }
+       return;
+   }
+   if ($$ref{'Comp Status'} eq 'Closed') {
+       #print "Comp Complete=>$$ref{'Comp Complete'}";
+       if ($$ref{'Comp Complete'}){
+          $arrays{lc $$ref{'Disk Subsystem'}}{reclaimed}+=$$ref{'Alloc'};
+          $total_closed++;
+          $total_gb_reclaimed+=$$ref{Alloc};
+          my $epoch=date_to_epoch($$ref{'Comp Complete'});
+          if ($epoch){ 
+             my ($s,$mi,$h,$m,$mo,$y,$w,$ye,$i)=localtime($epoch);$mo++;
+             my $test_year=$y+1900;
+             $year_to_date{closed}++ if ($epoch > $curr_yr_start);
+             $monthly{$y}{$mo}{total_comps_closed}++;
+             $monthly{$y}{$mo}{total_reclaim}+=$$ref{Alloc} if $$ref{Alloc};
+             $monthly{$y}{$mo}{full_comps_closed}++ if (lc $$add_info{'f_p'} eq 'f');
+              $monthly{$y}{$mo}{partial_comps_closed}++ if (lc $$add_info{'f_p'} eq 'p');
+             if (($mo == $mon)and($y == $year)){#if comp closed=current mon+year
+                $users_where{$$ref{'Disk Tech'}}{mon_closed}++;
+                $users_where{$$ref{'Disk Tech'}}{mon_alloc}+=$$ref{Alloc};
+             }
+             if ($$ref{'Disk Product'} eq 'Network Attached'){
+               $monthly{$y}{$mo}{nas_reclaim}+=$$ref{Alloc} if ($$ref{Alloc});
+            }
+            if ($$ref{'Disk Product'} eq 'SAN Attached'){
+               $monthly{$y}{$mo}{san_reclaim}+=$$ref{Alloc} if ($$ref{Alloc});
+            }
+             $year_to_date{reclaimed}+=$$ref{Alloc} if ($epoch > $curr_yr_start);
+          }#if $epoch
+   #print "CLOSED SRDB.comp=>$$ref{SRDB} $$ref{Comp} comp closed=> $$ref{'Comp Complete'} ";
+       }
+       #say "Array name=$$ref{'Disk Subsystem'}";
+   }#end if 'Comp Status' eq Closed
+   if (($$ref{'Comp Status'} eq 'Capacity_Reserved') ||
+       ($$ref{'Comp Status'} eq 'New')){
+        $total_open+=1;
+        $users_where{$$ref{'Disk Tech'}}{'open'}+=1;
+        $arrays{lc $$ref{'Disk Subsystem'}}{pending}+=$$ref{'Alloc'};
+   }
+        $epoch=date_to_epoch($$ref{Comp_Create_Date});
+        if ($epoch){
+          my ($s,$mi,$h,$m,$mo,$y,$w,$ye,$i)=localtime($epoch);$mo++;
+          $year_to_date{created}++ if ($epoch > $curr_yr_start);
+          $monthly{$y}{$mo}{total_comps_open}++;
+          $monthly{$y}{$mo}{full_comps_open}++ if (lc $$add_info{'f_p'} eq 'f');
+          $monthly{$y}{$mo}{partial_comps_open}++ if(lc $$add_info{'f_p'} eq 'p');
+        }#if epoch
+}
+###########################################################################
+sub parse_team{
+###########################################################################
+## parse the tracker.conf %config to determine the $mail_to
+## and to load the users tech hash minus team
+    my $in_hash=$_[0];
+    my $junk;
+    my %hash_of_team;
+    unless ($mail_to_cmd) {
+      ($junk,$mail_to_cmd)=split /,/,$$in_hash{team} 
+    }
+    foreach (keys %$in_hash){
+       next if ($_ eq 'team');
+       $hash_of_team{$_}=1;
+    }
+    return %hash_of_team;
+}
+###########################################################################
+sub load_techs{
+###########################################################################
+   my $techs=$_[0];
+   my $hash=$_[1];
+   my %users_where;
+   foreach (sort keys %$techs){
+      my $tech=lc $_;
+      my ($fullname,$append,$splash);
+      print "tech=>$_ " if $verbose;
+      unless ($$hash{$tech}){
+         say ",WARN unable to find $_ in tracker.conf";
+         next;
+      }
+      #($fullname,$append)=split /,/,$$hash{$tech};
+      ($fullname,$append,$splash)=split /,/,$$hash{$tech};
+      $mail_to.="$append," if $append;
+      my ($first,$middle,$last)=split /\s+/,$fullname;
+      if ($last){
+         $first="$first $middle";
+      } else { $last=$middle}
+      if ($verbose){
+          print "first=>$first<=  last=>$last";
+          print " splash=>$splash" if ($splash);
+          print "\n";
+      }
+      #$users_where{$first.$last}=$tech;
+      $users_where{"$first $last"}{short}=$tech;
+      $users_where{"$first $last"}{full}=$first.$last;
+      $users_where{"$first $last"}{'open'}=0;
+      $users_where{"$first $last"}{splash}=1 if $splash;
+   }
+   print Dumper(%users_where) if $debug;
+   return %users_where;
+}
+###########################################################################
+sub team_file_copies{
+###########################################################################
+    if ( -f $tracker_xls ){
+       unlink $tracker_xls or warn "Unable to unlink $tracker_xls $!\n";
+    }
+    copy ($excel_file,$tracker_xls) or warn "Unable to copy to $tracker_xls\n";
+    chmod 0444,$tracker_xls;
+}
+###########################################################################
+sub file_copies{
+###########################################################################
+    if ( -f $tracker_xls ){
+       unlink $tracker_xls or warn "Unable to unlink $tracker_xls $!\n";
+    }
+    copy ($excel_file,$tracker_xls) or warn "Unable to copy to $tracker_xls\n";
+    chmod 0444,$tracker_xls;
+    if ( -f $share_tracker){
+       unlink $share_tracker or warn "Unable to unlink $share_tracker $!\n";
+    }
+    copy ($excel_file,$share_tracker) or warn "Unable to copy to $share_tracker\n";
+    chmod 0444,$share_tracker;
+    unlink $excel_file if $excel_file;
+}
+###########################################################################
+sub gb_to_tb{
+###########################################################################
+   $year_to_date{reclaimed}=sprintf("%.2f",$year_to_date{reclaimed}/1024)||0;
+   $total_gb_reclaimed=sprintf("%.2f",$total_gb_reclaimed/1024)||0;
+   foreach my $tyear (%monthly){
+      foreach (%{$monthly{$tyear}}){
+         $monthly{$tyear}{$_}{san_reclaim}=sprintf("%.2f",$monthly{$tyear}{$_}{san_reclaim}/1024)||0;
+         $monthly{$tyear}{$_}{nas_reclaim}=sprintf("%.2f",$monthly{$tyear}{$_}{nas_reclaim}/1024)||0;
+         $monthly{$tyear}{$_}{total_reclaim}=sprintf("%.2f",$monthly{$tyear}{$_}{total_reclaim}/1024)||0;
+      }
+   }
+   foreach (keys %users_where){
+     $users_where{$_}{mon_alloc}=sprintf("%.2f",$users_where{$_}{mon_alloc}/1024)||0;
+   }
+=cut
+
+                          $monthly{$_}{$imonth}{san_reclaim}||'0',
+                          $monthly{$_}{$imonth}{nas_reclaim}||'0',
+                          $monthly{$_}{$imonth}{total_reclaim}||'0'
+$users_where{$$ref{'Disk Tech'}}{mon_alloc}+=$$ref{Alloc};
+=cut
+}
+###########################################################################
+sub send_email{
+###########################################################################
+    my @rpt_headers=rpt_headers;
+    #$formats{'all'}{12}{'width'}=40.2;
+    $formats{'all'}{1}{'width'}=9.5;
+    $formats{'all'}{2}{'width'}=8.5;
+    $formats{'all'}{3}{'width'}=10.8;
+    $formats{'all'}{4}{'width'}=10.5;
+    $formats{'all'}{5}{'width'}=15.9;
+    $formats{'all'}{8}{'width'}=18.5;
+    $formats{'all'}{11}{'width'}=7.9;
+    $formats{'all'}{12}{'width'}=7.5;
+    $formats{'all'}{13}{'width'}=18.5;
+    $formats{'all'}{14}{'width'}=12.5;
+    $formats{'all'}{17}{'width'}=30.2;
+    $formats{'all'}{18}{'width'}=35.2;
+    $formats{'all'}{19}{'width'}=30.2;
+    $formats{'all'}{20}{'width'}=30.2;
+    $formats{'all'}{42}{'width'}=70.2;
+    $formats{filter_column}{37}='compstatus eq New or compstatus eq Capacity_Reserved';
+#print Dumper(%formats);exit;
+    my $rpt_object=Rpt->new;
+    $rpt_object->excel_file($excel_file);
+    $rpt_object->excel_tabs('Tracker',\@rpt_headers,\@rpt,3,\%formats);
+    #$rpt_object->write_excel_file($excel_file,\@rpt_headers,\@rpt,3,\%formats);
+    #$rpt_object->email_attachment($excel_file);
+    unless ($team){
+       if ($rptflag){
+          my @array_headers=qw(Array Reclaimed Pending);
+          #$rpt_object->write_excel_file($rpt_file,\@array_headers,\@all_arrays);
+          $rpt_object->excel_tabs('Arrays Rpt',\@array_headers,\@all_arrays);
+       }
+       if (@lob_rpt){
+          my @array_headers=qw(LOB Pending_Cnt Pending_GB Closed_Cnt Closed_GB);
+          #$rpt_object->write_excel_file($lob_file,\@array_headers,\@lob_rpt);
+          $rpt_object->excel_tabs('LOB',\@array_headers,\@lob_rpt);
+       }
+    }#unless $team
+    my @month_header=('Month','Partial Comps Opened','Full Comps Opened','Total Comps Opened','Partial Comps Closed','Full Comps closed','Total Comps Closed','SAN TB Reclaimed','NAS TB Reclaimed','Total TB Reclaimed');
+    my @month_rpt;
+    #say "Current year $full_year cuurent month $mon";
+    #print Dumper(%monthly);
+    foreach (sort {$a<=>$b} keys %monthly){
+       my $iyear=$_+1900;
+       foreach my $imonth(sort {$a<=>$b} keys %{$monthly{$_}}){
+          next unless ($Common::num2mon{$imonth});
+          #print "$_ $iyear $imonth $Common::num2mon{$imonth}  $monthly{$_}{$imonth}{closed}\n ";
+          push @month_rpt,[
+                          "$Common::num2mon{$imonth} $iyear",
+                          $monthly{$_}{$imonth}{partial_comps_open}||'0',
+                          $monthly{$_}{$imonth}{full_comps_open}||'0',
+                          $monthly{$_}{$imonth}{total_comps_open}||'0',
+                          $monthly{$_}{$imonth}{partial_comps_closed}||'0',
+                          $monthly{$_}{$imonth}{full_comps_closed}||'0',
+                          $monthly{$_}{$imonth}{total_comps_closed}||'0',
+                          $monthly{$_}{$imonth}{san_reclaim}||'0',
+                          $monthly{$_}{$imonth}{nas_reclaim}||'0',
+                          $monthly{$_}{$imonth}{total_reclaim}||'0'
+                          
+                          ];#push @month_rpt
+       }
+       #print "\n";
+    }
+    $rpt_object->excel_tabs('Monthly',\@month_header,\@month_rpt);
+    $rpt_object->write_excel_tabs;
+    $rpt_object->email_attachment($excel_file);
+    $rpt_object->email_to($mail_to);
+    $rpt_object->email_from('Tracker_Report');
+    $rpt_object->email_subject("Reclaim Tracker ".curr_date_time);
+    if ($team){
+       $rpt_object->email_subject("Team $team Reclaim Tracker ".curr_date_time);
+    }
+
+    my @eheaders;
+    push @eheaders,curr_date_time;
+    unless ($team){
+    $rpt_object->MakeEmailBodyHeaders('Reclaims report ','',\@eheaders);
+    }
+    if ($team){
+      $rpt_object->MakeEmailBodyHeaders("$team Reclaims report ",'',\@eheaders);
+    }
+    my @email_headers=("Type","Total","$Common::num2mon{$mon} $full_year",$full_year);
+    push @email_rpt,['Comps Closed',$total_closed,$monthly{$year}{$mon}{total_comps_closed}||'0',$year_to_date{closed}||0];
+    push @email_rpt,['Comps Created',$total_created,$monthly{$year}{$mon}{created}||'0',$year_to_date{created}||0];
+    push @email_rpt,['TB reclaimed',$total_gb_reclaimed,$monthly{$year}{$mon}{total_reclaim}||'0',$year_to_date{reclaimed}||0];
+    push @email_rpt,['Comps Open',$total_open,'-'];
+    push @email_rpt,['Comps Rejected',$total_rejected,$monthly{$year}{$mon}{rejected}||'0',$year_to_date{rejected}||0];
+    push @email_rpt,['Comps Deleted',$total_delete,'-'];
+    $rpt_object->MakeEmailBody(\@email_headers,\@email_rpt);
+    $rpt_object->email("<br/>");
+    #######TECHS HTML SPLASH######
+    my @techs_rpt;
+    foreach my $full_tech (keys %users_where){
+       print "$full_tech " if $verbose;
+       print "$users_where{$full_tech}{splash} " if $verbose;
+       print $users_where{$full_tech}{open}."\n" if $verbose;
+       if ($users_where{$full_tech}{splash} ){
+           push @techs_rpt,[ 
+                          $users_where{$full_tech}{short},
+                          $users_where{$full_tech}{open}||'0',
+                          $users_where{$full_tech}{mon_closed}||'0',
+                          $users_where{$full_tech}{mon_alloc}||'0'
+                          ];
+       }
+    }
+    @email_headers=('Tech','Open Comps',
+                    "$Common::num2mon{$mon} $full_year Closed Comps",  
+                    "$Common::num2mon{$mon} $full_year TB reclaimed",  
+     );
+    $rpt_object->MakeEmailBody(\@email_headers,\@techs_rpt);
+    #######end TECHS HTML SPLASH######
+    $rpt_object->email("<br/>");
+    unless ($team){
+       if ($rptflag){
+          my @tmp_array;
+          my @head=qw(Array_Type Reclaimed Pending);
+          push @tmp_array,['VMAX',$vmax_reclaimed,$vmax_pending];
+          push @tmp_array,['DMX4',$dmx4_reclaimed,$dmx4_pending];
+          push @tmp_array,['OLDER',$older_reclaimed,$older_pending];
+          $rpt_object->MakeEmailBody(\@head,\@tmp_array);
+          $rpt_object->email("<br/>");
+       }
+    }#unless $team
+    my @footers;
+    push @footers,"$Common::basename ver $VERSION";
+    $rpt_object->MakeEmailFooter(\@footers);
+    #$rpt_object->SendEmail unless ($mail_to eq 'no');
+    #print $rpt_object->email unless ($silent);
+    #say "printing html_out $html_out";
+    open HTML_OUT,">$html_out" or warn "Unable to open $html_out $!\n";
+    print HTML_OUT $rpt_object->email;
+    print $rpt_object->email if $print_html;
+    close HTML_OUT;
+    my $cmd="cat $html_out $update_form > $index";
+    system($cmd);
+    $rpt_object->SendEmail unless ($mail_to eq 'none');
+    #say "sending email";
+    file_copies unless $team;
+    team_file_copies if $team;
+    if ($verbose){
+       say "Total_open=>$total_open";
+       say "Total_created=>$total_created ";
+       say "Total_closed=>$total_closed ";
+       say "Total_gb_reclaimed=>$total_gb_reclaimed ";
+       say "Total_delete=$total_delete";
+       say "Total_rejected=$total_rejected";
+       say " ";
+    }
+#$users_where{$$ref{'Disk Tech'}}{short}
+}
+###########################################################################
+sub map_nas{
+###########################################################################
+    my $ref=shift;
+    my $mounts;
+    #return undef unless ($$ref{'SRDB.Comp'});
+    return undef unless ($$ref{Comp});
+    #print "NDMP mounts for ";
+    #print $$ref{'SRDB.Comp'}."=>\n";
+    foreach ($$ref{nas_mount}){
+       #say $_;
+       next unless $_;
+       next if /^$/;
+       chomp $_;
+       $_=~s/\r+/ /g;
+       $_=~s/\n+/ /g;
+       $mounts.="$_ ";
+    }
+    #print "$mounts\n" if $mounts;
+    return $mounts;
+}
+###########################################################################
+sub map_wwpns{
+###########################################################################
+    my $ref=shift;
+    my $wwpns;
+    foreach ($$ref{'wwn0'},$$ref{'wwn1'},$$ref{'wwn2'},$$ref{'wwn3'}){
+      chomp $_;
+      next if /^$/;
+      next if /^disk\s*$/i;
+      next if /^tape\s*$/i;
+      next if ((/tape/i)&&(!/disk/i));
+      $_=~s/\r*//g;
+      $_=~s/\n*//g;
+      #say $_ if (/disk/i);next;
+      #next unless ($$ref{'SRDB.Comp'} == 10342.8 );
+      #say $$ref{'SRDB.Comp'}." $_" if (/disk/i);
+      if ((/disk/i)&&(/tape/i)){
+         if (/disk[\s\:]+(\w+)/i){ $wwpns.="$1 ";}
+          next;
+      }
+      #if (/([\.\s\w\:\-\/\\\(\)\&]*)disk([\.\s\w\:\-\/\\\(\)\&]*)/i){
+      if (/([\.\s\w\:\-\/\\\(\)\&]*)(disk|alt)([\.\s\w\:\-\/\\\(\)\&]*)/i){
+          my $txt;
+          if ($1){
+             $txt=$1;
+          } else {
+             $txt=$3;
+          }
+          next unless $txt;
+          next if ($txt=~ /HBA for local/i);
+          next if ($txt=~ /EMC/i);
+          $txt=~s/\(//g;
+          $txt=~s/\)//g;
+          $txt=~s/\\//g;
+          $txt=~s/\///g;
+          $txt=~s/\-//g;
+          $txt=~s/\://g;
+          $txt=~s/\s//g;
+          $txt=~s/\.//g;
+          $txt=~s/tape//ig;
+          $txt=~s/spare//ig;
+          $txt=~s/Alt/ /ig;
+          $wwpns.="$txt ";
+      } else { $wwpns.="$_ ";}
+      #if (/^disk(\s+|\-)([\s\w\:]+)/i){ $wwpns.="$2 "; next; }
+      #if (/^disk\/tape(\s+|\-)([\s\w\:]+)/i){ $wwpns.="$2 "; next; }
+      #if (/^disk\/tape(\s+|\-)([\s\w\:]+)/i){ $wwpns.="$2 "; next; }
+    }#end foreach
+    if ($wwpns){
+       $wwpns=~s/://g;
+       #say "Return ".$$ref{'SRDB.Comp'}."=>$wwpns";
+    }
+    return $wwpns;
+}
+###########################################################################
+sub map_disk_notes2{
+###########################################################################
+my %map_fields=(
+               'sent'=>'-',
+               'complete'=>'-',
+               'switch'=>'-',
+               'ports'=>'-',
+               );
+    return \%map_fields unless $_[0];
+    my @lines=split /\n/,$_[0];
+    foreach (@lines){
+       chomp $_;
+       $_ =~ s/\r*//g ;
+       $_=~s/\n*//g;
+       #say $_;
+       if (/Sent:(.*)/i){ $map_fields{sent}=$1||' ';next;}
+       if (/Complete:(.*)/i){ $map_fields{complete}=$1||' ';next;}
+       if (/Switch:(.*)/i){ $map_fields{'switch'}=$1||' ';next;}
+       if (/Ports:(.*)/i){ $map_fields{ports}=$1||' ';next;}
+    }
+    return \%map_fields;
+}
+###########################################################################
+sub map_Additional_Comp_Info{
+###########################################################################
+my %map_fields=(
+               'sdr'=>'-',
+               'crr'=>'-',
+               'submit'=>'-',
+               'status'=>'-',
+               'sa_tracker'=>'-',
+               'follow_up'=>'-',
+               'zoning'=>'-',
+               'fms_server'=>'-',
+               'f_p'=>'-',
+               'masters'=>'-',
+               'org'=>'-',
+               'notes'=>'-',
+               'comments'=>'-',
+);
+    return \%map_fields unless $_[0];
+    my @lines=split /[\n|\r]/,$_[0];
+    foreach (@lines){
+       chomp $_;
+       $_ =~ s/\r*//g ;
+       $_=~s/\n*//g;
+       #say $_;
+
+       if (/SDR:(.*)/i){ $map_fields{sdr}=$1||' ';next;}
+       if (/CRR:(.*)/i){ $map_fields{crr}=$1||' ';next;}
+       if (/Submitted:(.*)/i){ $map_fields{submit}=$1||' ';next;}
+       if (/Status:(.*)/i){ $map_fields{status}=$1||' ';next;}
+       if (/SA Tracker:(.*)/i){ $map_fields{sa_tracker}=$1||' ';next;}
+       if (/Follow-Up:(.*)/i){ $map_fields{follow_up}=$1||' ';next;}
+       if (/Follow Up:(.*)/i){ $map_fields{follow_up}=$1||' ';next;}
+       if (/Zoning:(.*)/i){ $map_fields{zoning}=$1||' ';next;}
+       if (/FMS Server:(.*)/i){ $map_fields{fms_server}=$1||' ';next;}
+       if (/F\/P:(.*)/i){ $map_fields{f_p}=$1||' ';next;}
+       if (/Masters:(.*)/i){ $map_fields{masters}=$1||' ';next;}
+       if (/Org:(.*)/i){ $map_fields{org}=$1||' ';next;}
+       if (/Notes:(.*)/i){ $map_fields{notes}=$1||' ';next;}
+       if (/Comments:(.*)/i){ $map_fields{comments}=$1||' ';next;}
+    } 
+    return \%map_fields;
+}#end map_Additional_Comp_Info
+###########################################################################
+sub rpt_headers{
+###########################################################################
+    my @headers=(
+      'Scheduled',
+      'SRDB',
+      'Comp',
+      'Nexus',
+      'Org',
+      'Server Name',
+      'Alloc',
+      'Disk Type',
+      'Disk Subsystem',
+      'Serial',
+      'Disk Tech',
+      'SDR',
+      'F/P',
+      'Status',
+      'SA Tracker',
+      'Decomm Tech',
+      'Masters',
+      'Management Console',
+      'Wwpns',
+      'Switch',
+      'Location',
+      'Ports',
+      'CRR',
+      'CRR Submitted',
+      'DG email sent',
+      'CRR Complete',
+      'Zoning',
+      'Comp Create',
+      'Client ETA',
+      'FMS Server',
+      'AIT',
+      'Follow Up',
+      'Contact',
+      'SSE',
+      'Last Update',
+      'Last Updated by',
+      'Disk Product',
+      'Comp Status',
+      'ADR',
+      'Comp Complete',
+      'Growth Type',
+      'Comp LOB',
+      'Notes'
+   );
+   return @headers;
+}#end sub rpt_headers
+###########################################################################
+sub dtt{
+###########################################################################
+   my %servers;
+   my $DSN='dbi:ODBC:DTT';
+   my $username='SRDB_RO';
+   my $auth='Bank4you!';
+   #my $dbh = DBI->connect($DSN,$username,$auth,{ RaiseError => 1, AutoCommit => 0 });
+
+   my $dbh = DBI->connect($DSN,$username,$auth,{ PrintError => 1,AutoCommit => 0 });
+   unless ($dbh){
+     logit "ERROR Failed to connect to DTT";
+     return undef;
+   }
+   my $query=<<END;
+SELECT
+Decomm_Request_Tracking.[Server Name] AS 'server',
+Decomm_Request_Tracking.[Stage] AS 'stage',
+Decomm_Request_Tracking.[Scheduled Power Down Date] AS 'power_down',
+Decomm_Request_Tracking.DecommTech
+FROM
+DecommTracking.dbo.Decomm_Request_Tracking Decomm_Request_Tracking
+WHERE 
+Decomm_Request_Tracking.[Server Name] is not NULL
+AND
+Decomm_Request_Tracking.[Stage] is not NULL
+END
+   my $sth = $dbh->prepare($query);
+   $sth->{LongReadLen}=180;
+   my $rv = $sth->execute;
+   unless ($rv) {
+     logit "ERROR with sql-> $dbh->errstr.";
+     return undef;
+   }
+   while (my $ref = $sth->fetchrow_hashref) {
+     #print "$_\n" foreach (keys %$ref);
+     #next unless ($$ref{server} =~ /MPTELCOWS142/i);
+          #print "$$ref{server},$$ref{stage},$$ref{power_down}\n";
+     
+     if ((defined $$ref{stage})and ($$ref{stage}=~/^(\S+)-/)){
+        $servers{lc $$ref{server}}{stage}=$1;
+     }
+     if (($$ref{power_down})and($$ref{power_down}=~/^(\S+)\s+/)){
+        $servers{lc $$ref{server}}{power_down}=$1;
+        $servers{lc $$ref{server}}{power_down}=~s/-/\//g;
+     }
+     if ($$ref{DecommTech}) {
+       $servers{lc $$ref{server}}{tech}=$$ref{DecommTech};
+     }
+   }#end while my $ref = $sth->fetchrow_hashref
+   $sth->finish;
+   $dbh->rollback;
+   $dbh->disconnect;
+   return \%servers;
+}
+###########################################################################
+sub select_query{
+###########################################################################
+my $select_query=<<END;
+SELECT
+user_sse.FirstName + ' ' + user_sse.LastName as 'SSE_Name',
+StorageReqs_Server.Server_Name,
+StorageReqs_Request_Component.Growth_Type,
+StorageReqs_Request_Component.Target_Impl_Date,
+StorageReqs_Request_Component.Comp_Create_Date,
+StorageReqs_Request_Component.comp_reject_date,
+StorageReqs_Storage_Request.Request_Status AS 'Request_Status',
+StorageReqs_Request_Component.Disk_Checklist5_TD AS 'Scheduled',
+--cast(StorageReqs_Request_Component.Request_ID as varchar) + '.' + cast(StorageReqs_Request_Component.Comp_ID as varchar) as 'SRDB.Comp',
+StorageReqs_Request_Component.Request_ID as 'SRDB',
+StorageReqs_Request_Component.Comp_ID AS 'Comp',
+StorageReqs_Storage_Request.NSR_NWR AS 'Nexus',
+StorageReqs_Request_Component.AIT_Number AS 'AIT',
+StorageReqs_Server.Server_Name AS 'Server Name',
+StorageReqs_Request_Component.Disk_Data_Volume AS 'Alloc',
+StorageReqs_Request_Component.Disk_Subsystem_Name AS 'Disk Subsystem',
+StorageReqs_Request_Component.Disk_Subsystem_Serial_Number AS 'Serial',
+StorageReqs_Request_Component.Disk_Storage_Interface AS 'Management Console',
+StorageReqs_Request_Component.Disk_Product AS 'Disk_Type',
+StorageReqs_Users.FirstName + ' ' + StorageReqs_Users.LastName AS 'Disk Tech',
+StorageReqs_Server.Slot0_WWN AS 'wwn0',
+StorageReqs_Server.Slot1_WWN AS 'wwn1',
+StorageReqs_Server.Slot2_WWN AS 'wwn2',
+StorageReqs_Server.Additional_HBA_WWN_Info AS 'wwn3',
+--StorageReqs_Server.NAS_NDMP_Mount_Points as 'nas_mount',
+StorageReqs_Request_Component.NAS_NDMP_Mount_Points as 'nas_mount',
+StorageReqs_Storage_Request.Requester_PN AS 'Contact',
+StorageReqs_Storage_Request.Last_Updated_Timestamp AS 'Last Update',
+(SELECT  FirstName + ' ' + LastName FROM StorageReqs_Users WHERE  StorageReqs_Storage_Request.Last_Updated_By = StorageReqs_Users.PersonNumber) AS 'Last Updated by',
+StorageReqs_Request_Component.Disk_Checklist2_Notes AS 'Disk_Notes2',
+StorageReqs_Request_Component.Connectivity_Type AS 'Disk Product',
+StorageReqs_Request_Component.Comp_Status AS 'Comp Status',
+StorageReqs_Request_Component.Disk_Checklist5_CD AS 'Comp Complete',
+StorageReqs_Request_Component.LOB AS 'Comp LOB',
+StorageReqs_Storage_Request.Assign_Resources AS 'ADR',
+StorageReqs_Request_Component.Additional_Comp_Info
+END
+return $select_query;
+}
+###########################################################################
+sub from_query{
+###########################################################################
+my $from_query=<<END;
+FROM StorageReqs_Request_Component LEFT OUTER JOIN StorageReqs_Server
+ ON ISNULL(StorageReqs_Request_Component.Server_ID,0) = StorageReqs_Server.Server_ID
+INNER JOIN StorageReqs_Storage_Request ON StorageReqs_Request_Component.Request_ID = StorageReqs_Storage_Request.Request_ID 
+LEFT OUTER JOIN StorageReqs_Users ON ISNULL(StorageReqs_Request_Component.disk_contact_primary_pn,0)  = cast(StorageReqs_Users.PersonNumber as varchar) 
+LEFT OUTER JOIN Storagereqs_Users as user_sse ON ISNULL(StorageReqs_Storage_Request.Assigned_CSR,0) = cast(user_sse.PersonNumber as varchar)
+END
+return $from_query;
+}
+###########################################################################
+sub where_query{
+###########################################################################
+my $append_txt;
+if (%users_where and !$srdb_num){
+   $append_txt="OR (StorageReqs_Request_Component.Growth_Type in ('Reclaim')";
+   $append_txt.="AND (StorageReqs_Users.FirstName + StorageReqs_Users.LastName in (";
+   my $first=1;
+   foreach (keys %users_where){
+      $append_txt.="," unless ($first);
+      $append_txt.="'".$users_where{$_}{full}."'";
+      $first=0;
+   }
+   $append_txt.=")))\n";
+}
+if (%team_where){
+   #$append_txt.="AND (SSE_Name in (";
+   $append_txt.="AND (user_sse.FirstName + user_sse.LastName in (";
+   my $first=1;
+   foreach (keys %team_where){
+      $append_txt.="," unless ($first);
+      $append_txt.="'".$team_where{$_}{full}."'";
+      $first=0;
+   }
+   $append_txt.=")";
+   $append_txt.="AND StorageReqs_Request_Component.Comp_Status = ('Capacity_Reserved')";
+   $append_txt.=")\n";
+}
+if ($srdb_num){
+   $append_txt=<<APPEND;
+   AND (StorageReqs_Request_Component.Request_ID in ('$srdb_num'))
+   OR (StorageReqs_Request_Component.Growth_Type in ('Reclaim')
+       AND (StorageReqs_Request_Component.Request_ID in ('$srdb_num')))
+APPEND
+}
+#say "$append_txt";exit;
+#$append_txt="AND (StorageReqs_Users.FirstName + StorageReqs_Users.LastName in ('CraigDwyer','MichaelDenney','Raja VenkatKondu'))";
+
+#(StorageReqs_Request_Component.Growth_Type in ('Reclaim','Reclaim Factory'))
+my $where_query=<<END;
+WHERE
+(StorageReqs_Request_Component.Growth_Type in ('Reclaim Factory'))
+END
+$where_query.=$append_txt;
+return $where_query;
+}
+###########################################################################
+sub order_query{
+###########################################################################
+my $order_query=<<END;
+ORDER BY
+   StorageReqs_Request_Component.Request_ID DESC,
+   StorageReqs_Request_Component.COMP_ID DESC
+END
+return $order_query;
+}

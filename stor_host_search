@@ -1,0 +1,556 @@
+#michael.s.denney@gmail.com
+##########################################################
+# stor_host_search
+#Michael.S.Denney@gmail.com
+my $VERSION=1.01;
+##########################################################
+#TO DO:
+##########################################################
+use common::sense;
+use Data::Dumper;
+use Getopt::Long;
+use Env;
+use DBI;
+use Common;
+use Rpt;
+##################Global VARS#################################
+use vars qw($print_sql $devs_h $host_h @hosts_rpt @devs_rpt);
+use vars qw(@hosts_header @devs_header @others_header @others_rpt);
+use vars qw($mail_to $host_search @wwn_search $found_host);
+use vars qw($excel_file @host_search_rpt @host_search_logins);
+use vars qw(@host_logins_header $host_logins_color);
+use vars qw(@host_search_header);
+use vars qw(@host_search_others_rpt);
+################## subs  #################################
+use subs qw(get_dev_rpt load_dev_rpt get_host_rpt load_dev_rpt);
+use subs qw(devs_query get_others others_query load_others_rpt);
+use subs qw(host_query send_email prep_email usage make_excel host_search);
+use subs qw(sanitize_wwn get_wwn_host wwn_host_query);
+use subs qw(get_tech);
+##############################################################
+$Common::log_off=1;
+exit 1 unless GetOptions(
+                         'm=s' => \$mail_to,
+                         'h|host=s' => \$host_search,
+                         'w|wwn=s' => \@wwn_search
+);
+usage unless ($host_search or @wwn_search);
+if ($host_search and @wwn_search){
+   print "Can not specify both -h|--host and -w|-wwn\n";exit 1;
+}
+sanitize_wwn if @wwn_search;
+$found_host = $host_search if $host_search;
+###################Global Path variables ###############
+my $script=$FindBin::Script;
+my $script_path=$FindBin::Bin;
+my $base=$script_path;
+$base=~s/bin$//;
+my $log_path="$base/log";
+my $logfile="$log_path/$script.log";
+my $errlog="$log_path/$script.err_log";
+$excel_file="/tmp/$host_search.xls" if $host_search;
+$excel_file="/tmp/$wwn_search[0].xls" if @wwn_search;
+##############################################################
+#                  MAIN ()
+##############################################################
+get_tech unless ($mail_to);
+my $DSN='dbi:ODBC:DWH';
+my $username='dwh';
+my $auth='sanscreen';
+my $dbh = DBI->connect($DSN,$username,$auth,{ RaiseError => 1, AutoCommit => 0 });
+unless ($dbh){
+  print "Failed to connect\n";
+  exit 1;
+}
+my ($found_wwns)=get_wwn_host;
+if ($host_search and !$found_wwns and !$found_host){
+   print "Host search>Host and WWN not found in Oncommand DB\n";exit 1;
+}
+if ((@wwn_search) and !($found_wwns and $found_host)){
+   print "WWN search>Host and WWN not found in Oncommand DB\n";exit 1;
+}
+$host_h=get_host_rpt;
+print "host info not found\n" unless ($host_h);
+load_host_rpt($found_wwns,$host_h);
+$devs_h=get_dev_rpt;
+print "no devs found\n" unless ($devs_h);
+load_dev_rpt($devs_h);
+get_others($devs_h);
+$dbh->rollback;
+$dbh->disconnect;
+host_search($found_wwns);
+my $rpt_object=Rpt->new;
+unless ($found_wwns){
+   print "No Info Found\n" ;
+   exit 1;
+}
+make_excel;
+prep_email;
+if ($mail_to){
+   send_email;
+}
+unlink $excel_file if (-f $excel_file);
+##############################################################
+#                  END MAIN ()
+##############################################################
+###########################################################################
+sub get_tech{
+###########################################################################
+   my %configs=read_config('/usr/local/etc/tracker.conf');
+   my $name=getlogin;
+   say "my name is $name";
+   return;
+   exit;
+}
+###########################################################################
+sub make_excel{
+###########################################################################
+   #return undef unless (@wwns);
+   say "making excel";
+   #return undef unless (@hosts_rpt or @devs_rpt or @others_rpt or @host_search_rpt or @host_search_others_rpt);
+   $rpt_object->excel_file($excel_file);
+   $rpt_object->excel_tabs('WWN_Info',\@hosts_header,\@hosts_rpt) if @hosts_rpt;
+   $rpt_object->excel_tabs('DEVS_Info',\@devs_header,\@devs_rpt) if @devs_rpt;
+   $rpt_object->excel_tabs('OTHER_Hosts_Info',\@others_header,\@others_rpt) if @others_rpt;
+   $rpt_object->excel_tabs('hs_DEVS_Info',\@host_search_header,\@host_search_rpt) if @host_search_rpt;
+   $rpt_object->excel_tabs('hs_OTHER_Hosts_Info',\@host_search_header,\@host_search_others_rpt) if @host_search_others_rpt;
+   $rpt_object->write_excel_tabs if ($rpt_object->excel_tabs);
+}
+###########################################################################
+sub prep_email{
+###########################################################################
+   my @eheaders;
+   push @eheaders,join(" ",@$found_wwns);
+   push @eheaders,$host_search if $host_search;
+   push @eheaders,$found_host if $found_host;
+   push @eheaders,'cluster detected' if (@others_rpt or @host_search_others_rpt);
+   $rpt_object->MakeEmailBodyHeaders('Storage Host Search','',\@eheaders);
+   $rpt_object->MakeEmailBody(\@hosts_header,\@hosts_rpt) if @hosts_rpt;
+   my @title=('host_search logins');
+   $rpt_object->MakeEmailStatusHeaders($host_logins_color,\@title) if @host_search_logins;
+   $rpt_object->MakeEmailBody(\@host_logins_header,\@host_search_logins) if @host_search_logins;
+   my @footers;
+   push @footers,"$Common::basename ver $VERSION";
+   return 1;
+}
+###########################################################################
+sub send_email{
+###########################################################################
+   say "sending email";
+   $rpt_object->email_attachment($excel_file);
+   $rpt_object->email_to($mail_to);
+   $rpt_object->email_from('stor_host_search');
+   my $subject="stor_host_search ";
+   $subject.=$found_host if $found_host; 
+   $subject="stor_host_search $host_search" if $host_search; 
+   $rpt_object->email_subject($subject);
+   $rpt_object->SendEmail unless ($mail_to eq 'none')
+}
+###########################################################################
+sub get_others{
+############################################################################
+  say "getting OCI other devs";
+  my $devs=shift;
+  my %others;
+  @others_header=('storage_serial ','dev ','other_host ','wwn ');
+  foreach my $serial (keys %$devs){
+     my @devs;
+     foreach (keys %{$$devs{$serial}}){
+        push @devs,$_;
+     }
+     my $query=others_query($serial,\@devs);
+     #say $query;#exit;
+     my $sth = $dbh->prepare($query);
+     $sth->{LongReadLen}=180;
+     my $rv = $sth->execute;
+     unless ($rv) {
+       print ERROR with sql-> $dbh->errstr."\n";
+       exit 1;
+     }
+     while (my $ref = $sth->fetchrow_hashref) {
+        #say "server=>$$ref{server} found_host=>$$ref{server}";
+        next if (uc $$ref{server} eq uc $found_host);
+        #print "$_ " foreach (keys %$ref);print "\n";
+        $$ref{wwn}=~s/://g if $$ref{wwn};
+        push @others_rpt,[$serial,$$ref{dev}||' ',
+                          $$ref{server}||' ',
+                          $$ref{wwn}||' '];
+     }#while (my $ref = $sth->fetchrow_hashref) {
+  }#foreach my $serial (keys %$devs){
+
+}
+###########################################################################
+sub load_host_rpt{
+###########################################################################
+   my $found_wwns=shift;
+   my $hosts=shift;
+   #print Dumper(%$hosts);
+@hosts_header=('hostname ','wwwn ','zone_name ','switch_name ','port_num ','port_active ','port_status ');
+  foreach my $hostN (keys %$hosts){
+     foreach (keys %{$$hosts{$hostN}}){
+        push @hosts_rpt,[$hostN,$_,$$hosts{$hostN}{$_}{zoneName},
+                        $$hosts{$hostN}{$_}{switch_name},
+                        $$hosts{$hostN}{$_}{switch_port_num},
+                        $$hosts{$hostN}{$_}{switch_port_active},
+                        $$hosts{$hostN}{$_}{switch_port_status}
+                       ];
+     }#foreach (keys %{$$hosts{$hostN}}){
+  }#foreach my $hostN (keys %$hosts){
+  unless (@hosts_rpt){
+        foreach (@$found_wwns){
+           push @hosts_rpt,[$found_host,$_,' ',' ',' ',' ',' '];
+        }
+  }
+  #print Dumper(@hosts_rpt); print "after hosts_rpt\n";exit;
+}
+###########################################################################
+sub get_host_rpt{
+###########################################################################
+  say "getting OCI wwn info";
+  my %hosts;
+  my $query=host_query;
+  my $sth = $dbh->prepare($query);
+  $sth->{LongReadLen}=1024;
+  $sth->{LongTruncOk}=1;
+  my $rv = $sth->execute;
+  unless ($rv) {
+    print ERROR with sql-> $dbh->errstr."\n";
+    exit 1;
+  }
+#say $query;exit;
+   while (my $ref = $sth->fetchrow_hashref) {
+     #print "$_\n" foreach (keys %$ref);
+     unless ($$ref{host}){
+       print "host name not detecting, skipping row\n";
+       next;
+     }
+     unless ($$ref{host}){
+       print "wwn not detecting, skipping row\n";
+       next;
+     }
+     $$ref{wwn}=~s/://g;
+     $hosts{$$ref{host}}{$$ref{wwn}}{zoneName}=$$ref{zoneName}||' ';
+     $hosts{$$ref{host}}{$$ref{wwn}}{switch_name}=$$ref{switch_name}||' ';
+     $hosts{$$ref{host}}{$$ref{wwn}}{switch_port_num}=$$ref{switch_port_num}||' ';
+     $hosts{$$ref{host}}{$$ref{wwn}}{switch_port_status}=$$ref{switch_port_status}||' ';
+     $hosts{$$ref{host}}{$$ref{wwn}}{switch_port_active}=$$ref{switch_port_active}||' ';
+     $hosts{$$ref{host}}{$$ref{wwn}}{dataCenter}=$$ref{dataCenter}||' ';
+   }#end while my $ref = $sth->fetchrow_hashref
+   $sth->finish;
+   #print Dumper(%hosts);
+   return \%hosts;
+}
+###########################################################################
+sub get_wwn_host{
+###########################################################################
+   my %found_wwns;
+   my @wwns;
+   my $query=wwn_host_query;
+   my $sth = $dbh->prepare($query);
+   $sth->{LongReadLen}=180;
+   my $rv = $sth->execute;
+   unless ($rv) {
+      print ERROR with sql-> $dbh->errstr."\n";
+      exit 1;
+   }
+   while (my $ref = $sth->fetchrow_hashref) {
+      #say "###########";print "$_\n" foreach (keys %$ref);
+      $$ref{wwn}=~s/://g;
+      $found_wwns{$$ref{wwn}}=1 if $$ref{wwn};
+      $found_host=$$ref{name};
+   }#while
+   $sth->finish;
+   unless (@wwn_search){
+      push @wwns,$_ foreach (keys %found_wwns);
+      return \@wwns ;
+   }
+   $query=wwn_host_query;
+   $sth = $dbh->prepare($query);
+   $sth->{LongReadLen}=180;
+   $rv = $sth->execute;
+   unless ($rv) {
+      print ERROR with sql-> $dbh->errstr."\n";
+      exit 1;
+   }
+   while (my $ref = $sth->fetchrow_hashref) {
+      #print "$_\n" foreach (keys %$ref);
+      $$ref{wwn}=~s/://g;
+      $found_wwns{$$ref{wwn}}=1 if $$ref{wwn};
+      $found_host=$$ref{name};
+   }#while
+   $sth->finish;
+   push @wwns,$_ foreach (keys %found_wwns);
+   #print Dumper(@wwns);exit;
+   print "$_\n" foreach @wwns;
+   return \@wwns;
+}
+###########################################################################
+sub get_dev_rpt{
+###########################################################################
+  say 'getting OCI devs';
+  my %devs;
+  my $query=devs_query;
+  #say $query;
+  my $sth = $dbh->prepare($query);
+  $sth->{LongReadLen}=180;
+  my $rv = $sth->execute;
+  unless ($rv) {
+    print ERROR with sql-> $dbh->errstr."\n";
+    exit 1;
+  }
+   while (my $ref = $sth->fetchrow_hashref) {
+     #print "$_\n" foreach (keys %$ref);
+     unless ($$ref{serial}){
+       print "storage serial not detecting, skipping row\n";
+       next;
+     }
+     unless ($$ref{dev}){
+       print "device not detecting, skipping row\n";
+       next;
+     }
+     unless ($$ref{type}){
+       print "type not detecting, skipping row\n";
+       next;
+     }
+     $$ref{type}=~s/,//g;
+     $devs{$$ref{serial}}{$$ref{dev}}{model}=$$ref{model}||' ';
+     $devs{$$ref{serial}}{$$ref{dev}}{type}=$$ref{type};
+     $devs{$$ref{serial}}{$$ref{dev}}{capacityMB}=$$ref{capacityMB}||' ';
+     $devs{$$ref{serial}}{$$ref{dev}}{controller}.="$$ref{controller} "||' ';
+     #print "$$ref{serial} " || ' ';
+     #print "$$ref{dev} " || ' ';
+     #print "$$ref{type} " || ' ';
+     #print "$$ref{meta} " || ' ';
+     #print "$$ref{capacityMB} " || ' ';
+     #print "$$ref{controller} " || ' ';
+     #print "\n";
+   }#end while my $ref = $sth->fetchrow_hashref
+   $sth->finish;
+   return \%devs;
+}
+###########################################################################
+sub load_dev_rpt{
+###########################################################################
+@devs_header=('storage_serial ','model','dev ','FA ','Capacity_MB ','type ');
+  my $devs=shift;
+  foreach my $serial (keys %$devs){
+     foreach (keys %{$$devs{$serial}}){
+        push @devs_rpt,[$serial,
+                       $$devs{$serial}{$_}{model},
+                       $_,
+                       $$devs{$serial}{$_}{controller},
+                       $$devs{$serial}{$_}{capacityMB},
+                       $$devs{$serial}{$_}{type}
+                      ];
+        #print "$serial $_ ";
+        #print "$$devs{$serial}{$_}{controller} ";
+        #print "$$devs{$serial}{$_}{capacityMB} ";
+        #print "$$devs{$serial}{$_}{type} ";
+        #print "\n";
+     }# foreach (keys %{$$devs{$serial}}){
+  }#foreach my $serial (keys %$devs){
+  #print Dumper(@dev_rpt);
+}
+###########################################################################
+sub sanitize_wwn{
+###########################################################################
+   foreach (@wwn_search){
+      s/://g;
+      unless (length ($_) == 16){
+          print "$_ is not 16 char wwn\n";exit 1;  
+      }
+      unless (/^[a-fA-F0-9]/){
+          print "$_ contains non hexidecimal chars\n";exit 1;
+      }
+   }
+}
+###########################################################################
+sub wwn_to_colon{
+###########################################################################
+   my @colons=@wwn_search;
+   foreach (@colons){
+      s/([A-Fa-f0-9]{2})/$1:/g;
+      s/:$//g;
+      #print "$_\n";
+   }
+   return @colons;
+}
+###########################################################################
+sub wwn_host_query{
+###########################################################################
+my $q;
+$q="WHERE (UPPER(host.name) LIKE UPPER('%$found_host%'))" if $found_host;
+if (@wwn_search and !$found_host){
+    my @colons=wwn_to_colon;
+    my $first=1;
+    $q="WHERE (UPPER(host_port.wwn) IN \n(";
+    foreach (@colons){
+           $q.=",\n" unless $first;
+           $q.="UPPER('".$_."')";
+           $first=0;
+    }
+    $q.='))';
+}
+my $query=<<END;
+SELECT DISTINCT host.name, host_port.wwn
+  FROM    dwh_inventory.host_port host_port
+       INNER JOIN
+          dwh_inventory.host host
+       ON (host_port.hostId = host.id)
+$q
+END
+return $query;
+}
+###########################################################################
+sub host_query{
+###########################################################################
+my  $host_query=<<END;
+SELECT DISTINCT host.name AS host,
+       host_port.wwn,
+       zone_member.zoneName,
+       switch.name AS switch_name,
+       switch.dataCenter,
+       switch_port.number AS switch_port_num,
+       switch_port.status AS switch_port_status,
+       switch_port.active AS switch_port_active
+  FROM    (   (   (   (   dwh_inventory.port_connectivity port_connectivity
+                       INNER JOIN
+                          dwh_inventory.switch_port switch_port
+                       ON (port_connectivity.connectedId = switch_port.id))
+                   INNER JOIN
+                      dwh_inventory.host_port host_port
+                   ON (host_port.wwn = port_connectivity.wwn))
+               INNER JOIN
+                  dwh_inventory.host host
+               ON (host_port.hostId = host.id))
+           INNER JOIN
+              dwh_inventory.zone_member zone_member
+           ON (host_port.wwn = zone_member.wwn))
+       INNER JOIN
+          dwh_inventory.switch switch
+       ON (switch_port.switchId = switch.id)
+   WHERE (UPPER(host.name) LIKE UPPER('%$found_host%'))
+END
+#print "$host_query\n";
+return $host_query;
+}
+###########################################################################
+sub devs_query{
+###########################################################################
+my $query=<<END;
+SELECT DISTINCT storage.serialNumber AS serial,
+                storage.model,
+                volume.name as dev,
+                volume.capacityMB,
+                volume.type
+  FROM    (   (   dwh_inventory.volume volume
+                   INNER JOIN
+                      dwh_inventory.storage storage
+                   ON (volume.storageId = storage.id))
+               INNER JOIN
+                  dwh_inventory.volume_mask volume_mask
+               ON (volume_mask.storageId = storage.id)
+                  AND (volume_mask.volumeId = volume.id))
+       INNER JOIN
+          dwh_inventory.host host
+       ON (volume_mask.hostId = host.id)
+ WHERE (UPPER(host.name) LIKE UPPER('%$found_host%'))
+END
+return $query;
+           #--INNER JOIN
+              #--dwh_inventory.storage_port storage_port
+           #--ON (volume_mask.storagePortWwn = storage_port.wwn)
+              #--AND (storage_port.storageId = storage.id))
+}
+###########################################################################
+sub others_query{
+###########################################################################
+my $serial=shift;
+my $devs=shift;
+my $append="AND (UPPER(volume.name) IN (";
+my $first=1;
+foreach (@$devs){
+   #print "$_ ";
+   $append.=',' unless $first;
+   $append.="UPPER('$_')";
+   $first=0;
+}
+$append.='))';
+#print "\n";
+my $query=<<END;
+SELECT DISTINCT storage.serialNumber AS serial, 
+               volume.name AS dev, 
+               host.name AS server,
+               host_port.wwn
+FROM    (   (   (   dwh_inventory.volume_mask volume_mask
+                   INNER JOIN
+                      dwh_inventory.host host
+                   ON (volume_mask.hostId = host.id))
+               INNER JOIN
+                  dwh_inventory.volume volume
+               ON (volume_mask.volumeId = volume.id))
+           INNER JOIN
+              dwh_inventory.storage storage
+           ON (volume_mask.storageId = storage.id)
+              AND (volume.storageId = storage.id))
+       INNER JOIN
+          dwh_inventory.host_port host_port
+       ON (host_port.hostId = host.id)
+ WHERE (storage.serialNumber = '$serial')
+$append
+END
+return $query;
+       #AND (UPPER(volume.name) IN (UPPER('2022'), UPPER('061B')))
+}
+###########################################################################
+sub host_search{
+###########################################################################
+   say "getting host_search info";
+   my $wwns=shift;
+   return undef unless ($wwns);
+    $host_logins_color='Green';
+#Identifier       Type  Node Name        Port Name        FCID   In     Fabric
+   #@host_logins_header=('host_search logins');
+   @host_logins_header=('array ','www ','node ','port ','array logged in','fabric logged in','time stamp');
+   @host_search_header=('array','www ','dev','FA ','meta ','capacityMB','time stamp');
+   my $string=join " ",@$wwns;
+   my $cmd="host_search $string";
+   #say $cmd;
+   my ($stdout,$stderr)=run_cmd($cmd);
+   say "host_search ERR $_" foreach (@$stderr); 
+   return if (@$stderr);
+   my $listed;
+   foreach (@$stdout){
+     $listed=1 if /DEVS LISTED ABOVE/; 
+     #say $_;
+     #if (/^(\d+)\/logins:([0-9A-Za-z]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+=>(.+)/){
+     if (/^(\d+)\/logins:([0-9A-Za-z]+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+=>(.+$)/){
+         push @host_search_logins,[$1,$2,$4,$5,$7,$8,$9];
+     }
+     if (/^(\d+)\/wwn-devs:([0-9A-Za-z]+)\s+(\S+)\s+([0-9A-Za-z,:]+)\s([A-Z]*)\s*(\d+)\s+=>(.+)/){
+         if ($listed){
+            push @host_search_others_rpt,[$1,$2,$3,$4,$5,$6,$7] ;
+            #say "pushing host_search_others";
+            next;
+         }
+         #say "pushing host_search";
+         push @host_search_rpt,[$1,$2,$3,$4,$5,$6,$7];
+     }
+   }#foreach
+   #print Dumper(@host_search_logins);
+   #print Dumper(@host_search_others_rpt);exit;
+   #print Dumper(@host_search_rpt);exit;
+}
+###########################################################################
+sub usage{
+###########################################################################
+print<<END;
+NAME
+     stor_host_search - search multiple sources for storage info for a 
+                      hostname or wwn.
+SYNOPSIS
+     stor_host_search -h|--host <hostname> [-m <email\@address>]
+     stor_host_search -w|--wwn <wwn> [-w <wwn>...] [-m <email\@address>]
+END
+exit 1
+}

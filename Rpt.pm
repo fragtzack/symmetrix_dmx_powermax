@@ -424,10 +424,10 @@ sub SendEmail {
       $self->email_from($Common::basename);
    }
    my $sender=Mail::Sender->new({
-     smtp => 'mail.bankofamerica.com',
+     smtp => 'mail.abiz.com',
      auth => 'LOGIN',
-     authid => 'S0062595',
-     authpwd => 'ifp9ggyx',
+     authid => 'MickyMouse',
+     authpwd => 'FakePW',
      subject =>$self->email_subject,
      from =>$self->email_from,
      to =>$self->email_to,
